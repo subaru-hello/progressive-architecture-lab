@@ -1,0 +1,78 @@
+# api を Deployment で 3 レプリカ。probe / resources を宣言し、k8s に自己修復・配置を任せる。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: pal
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: pal-api:lv2
+          imagePullPolicy: IfNotPresent # k3d image import した local イメージを使う（レジストリを引かない）
+          env:
+            - { name: DATABASE_URL, value: "postgres://pal:pal@postgres:5432/pal" }
+            - { name: PORT, value: "3000" }
+            # Pod 名を instance に。レスポンスでどの Pod が処理したか見える。
+            - name: INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - containerPort: 3000
+          # startupProbe: 起動完了(=DB初期化してlisten)まで liveness/readiness を抑止。
+          # これが無いと DB 起動待ちの間に liveness が落ちて再起動ループになる。
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            periodSeconds: 3
+            failureThreshold: 30 # 最大 90s まで起動を待つ
+          # Readiness: DB 疎通が取れるまでトラフィックを流さない。
+          # timeout/failureThreshold を緩めに: CPU律速でイベントループが一時的に詰まっても
+          # 即 Service から外さない（外すと残り Pod に負荷集中→雪崩る）。
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Liveness: 本当に死んだ時だけ再起動。高負荷の一時的無応答で殺さないよう寛容に。
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          # CPU 律速ワークロードに limits.cpu を付けると CFS スロットリングで詰まり、
+          # Traefik がタイムアウトして 502 を量産する（実測: 98.8% error）。
+          # → CPU limit は付けない。requests は「スケジューリングの最低保証」用に残す。
+          #   （Lv1 のコンテナも CPU 無制限だった。ここを揃える）
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: pal
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 3000

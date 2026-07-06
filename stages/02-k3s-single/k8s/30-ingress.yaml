@@ -1,0 +1,19 @@
+# k3s 標準の Ingress Controller = Traefik。外部(ホスト)からの入口。
+# k3d の loadbalancer 経由でホスト :8081 -> Traefik :80 -> この Ingress -> api Service。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+  namespace: pal
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
