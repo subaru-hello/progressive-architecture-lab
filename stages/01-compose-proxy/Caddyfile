@@ -1,0 +1,14 @@
+# Caddy = リバースプロキシ / ロードバランサ。ホストの :8080 で受けて api レプリカ群へ振る。
+:80 {
+	reverse_proxy {
+		# Docker DNS(127.0.0.11) を定期的に引き直し、api サービスの全レプリカIPを取得。
+		# これで --scale や deploy.replicas を増やすと自動で振り分け先が増える。
+		dynamic a {
+			name api
+			port 3000
+			refresh 2s
+			resolvers 127.0.0.11
+		}
+		lb_policy round_robin
+	}
+}

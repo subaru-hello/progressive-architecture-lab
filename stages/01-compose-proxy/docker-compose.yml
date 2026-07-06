@@ -1,0 +1,44 @@
+# Lv1 — リバースプロキシ + 複数レプリカ。Lv0 の「ポート衝突で増やせない」を解決する段。
+#   caddy(:8080) --round robin--> api x3 --> db
+# 起動: docker compose -f stages/01-compose-proxy/docker-compose.yml up --build -d
+name: pal-lv1
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pal
+      POSTGRES_PASSWORD: pal
+      POSTGRES_DB: pal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      PORT: "3000"
+    expose:
+      - "3000" # ホストには公開しない。Caddy だけが到達できる
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      replicas: 3 # ← ここを増やすだけでスケール（docker compose up --scale api=N でも可）
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:80" # ホストの入口はここ 1 つだけ
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
