@@ -10,6 +10,7 @@
 
 ## 目次
 - [Lv0 — docker-compose](00-lv0.md)
+- [番外編 — Go vs Node（CPU 律速はどこまで捌けるか）](note-go-vs-node.md)
 - Lv1 — compose + proxy（予定）
 - Lv2 — k3s 単一ノード（予定）
 - Lv3 — k8s 複数ノード + HPA（予定）
