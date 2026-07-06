@@ -1,0 +1,71 @@
+# api: HPA が台数を管理するので replicas は min 値(2)。probe は Lv2 で学んだ寛容設定を継承。
+# topologySpreadConstraints で Pod を複数ノードに分散させる。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: pal
+spec:
+  replicas: 2 # 初期値=HPA minReplicas。以降は HPA が上書きして増減する
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      # Pod をノード間になるべく均等に配置（maxSkew:1）。片寄っても配置は止めない(ScheduleAnyway)。
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: api
+      containers:
+        - name: api
+          image: pal-api:lv3
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: DATABASE_URL, value: "postgres://pal:pal@postgres:5432/pal" }
+            - { name: PORT, value: "3000" }
+            - name: INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - containerPort: 3000
+          startupProbe:
+            httpGet: { path: /health, port: 3000 }
+            periodSeconds: 3
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /ready, port: 3000 }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /health, port: 3000 }
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          # requests.cpu は HPA の利用率計算の分母になる（重要）。limits.cpu は付けない(Lv2の教訓)。
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: pal
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 3000

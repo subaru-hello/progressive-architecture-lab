@@ -1,0 +1,30 @@
+# HPA: CPU 利用率が requests の 50% を超えたら Pod を増やす。min2 / max10。
+# metrics-server（k3s 同梱）が Pod の CPU 使用量を供給する。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  namespace: pal
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0 # 上げは即座に（飽和前に増設したい）
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 15 # 15 秒ごとに最大 +4 Pod
+    scaleDown:
+      stabilizationWindowSeconds: 60 # 下げは慎重に（フラッピング防止）
