@@ -64,7 +64,7 @@ docker compose -f stages/00-local-compose/docker-compose.yml down
 ## 学習ログ（ブログ用一次資料）
 
 各段の実行コマンド・出力・気づきを [`docs/learning-log/`](docs/learning-log) に時系列で残す。
-→ [Lv0 の記録](docs/learning-log/00-lv0.md)
+横断で効く教訓は [`LEARNINGS.md`](docs/learning-log/LEARNINGS.md) に段ごとに蓄積していく。
 
 ## 前提ツール
 
