@@ -1,0 +1,13 @@
+# Caddy = リバースプロキシ / ロードバランサ。ホストの :8080 で受けて api レプリカ群へ振る。
+# Lv1 と同一。api レプリカを増やすほど「単一DBへ集中する接続数」が増えるのがこの段の主役。
+:80 {
+	reverse_proxy {
+		dynamic a {
+			name api
+			port 3000
+			refresh 2s
+			resolvers 127.0.0.11
+		}
+		lb_policy round_robin
+	}
+}

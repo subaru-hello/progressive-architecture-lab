@@ -1,0 +1,54 @@
+# Lv4 フェーズA — 「単一DBの壁」を再現する。
+#   caddy(:8080) --round robin--> api x4 --(各 pool max=15, 直結)--> db(max_connections=20)
+#
+# 狙い: API を水平スケールするほど、各レプリカが単一 DB へ最大 15 本の接続を張りにいく。
+#       4 x 15 = 最大 60 本の要求に対し、db 側の受け口は max_connections=20（うち予約3で実質17）。
+#       負荷をかけると接続スロットが枯渇し `sorry, too many clients already` で 5xx が噴く。
+#       ＝「レプリカを増やしても、単一DBの接続スロットで頭打ち」を体感する段。
+#
+# 起動: docker compose -f stages/04-db-pooling/docker-compose.wall.yml up --build -d
+# 負荷: docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6 run - < load/db.js
+name: pal-lv4-wall
+
+services:
+  db:
+    image: postgres:16-alpine
+    # わざと接続スロットを絞り、壁を「現実的な負荷」で見えるようにする（本番でも接続は有限資源）。
+    command: ["postgres", "-c", "max_connections=20"]
+    environment:
+      POSTGRES_USER: pal
+      POSTGRES_PASSWORD: pal
+      POSTGRES_DB: pal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal # ← db へ直結（プーラなし）
+      PG_POOL_MAX: "15"                            # ← 各レプリカが張りにいく最大接続数
+      PORT: "3000"
+    expose:
+      - "3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      replicas: 4 # 4 x 15 = 60 本要求 >> db の 20 スロット → 枯渇
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

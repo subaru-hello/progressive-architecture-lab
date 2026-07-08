@@ -17,3 +17,4 @@
 - [Lv1 — compose + proxy（複数レプリカ + LB）](01-lv1.md)
 - [Lv2 — k3s 単一ノード（自己修復・probe 事故と対処）](02-lv2.md)
 - [Lv3 — k8s 複数ノード + HPA（自動スケール・エラー0%）](03-lv3.md)
+- [Lv4 — 単一DBの壁：コネクション枯渇 → PgBouncer](04-lv4.md)
