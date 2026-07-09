@@ -9,9 +9,16 @@ const PORT = Number(process.env.PORT ?? 3000);
 // INSTANCE_ID lets us SEE which replica/pod served a request (great for watching load balancing).
 const INSTANCE = process.env.INSTANCE_ID ?? os.hostname();
 
-const pool = new Pool({
+const writePool = new Pool({
   connectionString: process.env.DATABASE_URL,
   max: Number(process.env.PG_POOL_MAX ?? 10),
+});
+
+// readPool falls back to DATABASE_URL when DATABASE_URL_RO is not set.
+// This keeps Lv0–4 composes (which only set DATABASE_URL) working unchanged.
+const readPool = new Pool({
+  connectionString: process.env.DATABASE_URL_RO ?? process.env.DATABASE_URL,
+  max: Number(process.env.PG_POOL_MAX_RO ?? process.env.PG_POOL_MAX ?? 10),
 });
 
 // --- Prometheus metrics (observability from day 1) ---
@@ -27,7 +34,7 @@ const httpHistogram = new client.Histogram({
 });
 
 async function initDb(): Promise<void> {
-  await pool.query(`
+  await writePool.query(`
     CREATE TABLE IF NOT EXISTS items (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
@@ -47,9 +54,10 @@ app.addHook('onResponse', async (req, reply) => {
 app.get('/health', async () => ({ status: 'ok', instance: INSTANCE }));
 
 // Readiness: verifies DB reachability. k8s readinessProbe hits this.
+// Both writePool (primary) and readPool (replica or same as primary) must be reachable.
 app.get('/ready', async (_req, reply) => {
   try {
-    await pool.query('SELECT 1');
+    await Promise.all([writePool.query('SELECT 1'), readPool.query('SELECT 1')]);
     return { status: 'ready', instance: INSTANCE };
   } catch {
     reply.code(503);
@@ -76,7 +84,7 @@ app.get('/work', async (req) => {
 });
 
 app.get('/items', async () => {
-  const { rows } = await pool.query(
+  const { rows } = await readPool.query(
     'SELECT id, name, created_at FROM items ORDER BY id DESC LIMIT 100',
   );
   return { instance: INSTANCE, items: rows };
@@ -88,7 +96,7 @@ app.post('/items', async (req, reply) => {
     reply.code(400);
     return { error: 'name is required' };
   }
-  const { rows } = await pool.query(
+  const { rows } = await writePool.query(
     'INSERT INTO items(name) VALUES($1) RETURNING id, name, created_at',
     [body.name],
   );
@@ -96,10 +104,23 @@ app.post('/items', async (req, reply) => {
   return { instance: INSTANCE, item: rows[0] };
 });
 
+// Replication lag endpoint: only meaningful on a replica (primary returns null lag, which is normal).
+app.get('/replication', async (_req, reply) => {
+  try {
+    const { rows } = await readPool.query(
+      'SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))::float AS lag_seconds',
+    );
+    return { instance: INSTANCE, lag_seconds: rows[0].lag_seconds };
+  } catch {
+    reply.code(503);
+    return { instance: INSTANCE, error: 'replication query failed' };
+  }
+});
+
 app.get('/', async () => ({
   service: 'progressive-architecture-lab api',
   instance: INSTANCE,
-  endpoints: ['/health', '/ready', '/metrics', '/work?ms=&cpu=', 'GET/POST /items'],
+  endpoints: ['/health', '/ready', '/metrics', '/work?ms=&cpu=', 'GET/POST /items', '/replication'],
 }));
 
 async function main(): Promise<void> {
@@ -114,6 +135,22 @@ async function main(): Promise<void> {
       await new Promise((r) => setTimeout(r, 2000));
     }
   }
+  // The CREATE TABLE above runs on writePool (primary). When readPool is a replica,
+  // that DDL reaches it only after it streams over — so an early GET /items could hit
+  // the replica before `items` exists and 500 (cold-start read-after-write). Wait until
+  // the table is visible on readPool. When readPool == writePool (Lv0–4) this passes on
+  // the first try. to_regclass returns NULL (not an error) when the table is absent.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const { rows } = await readPool.query(`SELECT to_regclass('public.items') AS t`);
+      if (rows[0].t) break;
+    } catch {
+      // fall through to retry (readPool/replica may not be reachable yet)
+    }
+    if (attempt >= 30) throw new Error('items table not visible on readPool after 30 attempts');
+    app.log.warn(`readPool: waiting for items to replicate (attempt ${attempt}/30)...`);
+    await new Promise((r) => setTimeout(r, 1000));
+  }
   await app.listen({ port: PORT, host: '0.0.0.0' });
 }
 
@@ -123,7 +160,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     app.log.info(`${sig} received, shutting down...`);
     try {
       await app.close();
-      await pool.end();
+      await Promise.all([writePool.end(), readPool.end()]);
     } finally {
       process.exit(0);
     }

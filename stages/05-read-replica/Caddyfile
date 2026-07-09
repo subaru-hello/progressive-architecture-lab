@@ -1,0 +1,13 @@
+# Caddy = リバースプロキシ / ロードバランサ。ホストの :8080 で受けて api レプリカ群へ振る。
+# DB 前段には LB を置かない: read は replica 直結, write は primary 直結をアプリ層で制御。
+:80 {
+	reverse_proxy {
+		dynamic a {
+			name api
+			port 3000
+			refresh 2s
+			resolvers 127.0.0.11
+		}
+		lb_policy round_robin
+	}
+}
