@@ -12,6 +12,10 @@ const BASE_URL = __ENV.BASE_URL || 'http://host.docker.internal:8080';
 //   default 150 = moderate (primary not yet saturated, latency parity)
 //   e.g. 400    = stress   (wall primary hits ~100% CPU, write p95 diverges)
 const PEAK_VUS = Number(__ENV.PEAK_VUS || 150);
+// WRITE_RATIO controls the write fraction (default 5%). Lower it (e.g. 0.005)
+// to make the workload read-dominant — used in Lv6 to show that a cache's payoff
+// depends on how often writes invalidate it.
+const WRITE_RATIO = Number(__ENV.WRITE_RATIO || 0.05);
 
 // Separate Trend metrics so write p95 can be sliced independently from read p95.
 const write_latency = new Trend('write_latency', true);
@@ -33,8 +37,8 @@ export const options = {
 };
 
 export default function () {
-  if (Math.random() < 0.05) {
-    // 5%: write → primary (writePool)
+  if (Math.random() < WRITE_RATIO) {
+    // write → primary (writePool). In Lv6, each write DELs the cache key.
     const res = http.post(
       `${BASE_URL}/items`,
       JSON.stringify({ name: `k6-${__VU}-${__ITER}` }),

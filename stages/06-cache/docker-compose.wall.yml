@@ -1,0 +1,52 @@
+# Lv6 フェーズA — 「キャッシュなし」の壁を再現する。
+#   caddy(:8080) --round robin--> api x4 --> db (read も write も DB 直)
+#
+# 狙い: read 95%/write 5% の偏った負荷を単一 DB に集中させ、
+#       Redis キャッシュ追加前後のスループット差を体感する段。
+#       REDIS_URL を渡さない → readPool は毎回 SELECT を叩く。
+#
+# 起動: docker compose -f stages/06-cache/docker-compose.wall.yml up --build -d
+# 負荷: docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6 run - < load/read-heavy.js
+name: pal-lv6-wall
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pal
+      POSTGRES_PASSWORD: pal
+      POSTGRES_DB: pal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      # REDIS_URL not set → cache disabled, every GET hits DB directly (the wall).
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    expose:
+      - "3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      replicas: 4
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

@@ -2,6 +2,7 @@ import Fastify from 'fastify';
 import os from 'node:os';
 import pg from 'pg';
 import client from 'prom-client';
+import { Redis } from 'ioredis';
 
 const { Pool } = pg;
 
@@ -21,6 +22,23 @@ const readPool = new Pool({
   max: Number(process.env.PG_POOL_MAX_RO ?? process.env.PG_POOL_MAX ?? 10),
 });
 
+// --- Redis (optional cache layer) ---
+// REDIS_URL を設定しない compose (Lv0-5) では redis 変数は null のまま。
+// Redis が落ちても try/catch でフォールバックするので /ready には含めない。
+const REDIS_URL = process.env.REDIS_URL;
+let redis: Redis | null = null;
+if (REDIS_URL) {
+  redis = new Redis(REDIS_URL, {
+    lazyConnect: true,
+    maxRetriesPerRequest: 1,
+    connectTimeout: 2000,
+    enableOfflineQueue: false,
+  });
+  redis.on('error', () => {
+    // Suppress unhandled error events; individual call catch() handles fallback.
+  });
+}
+
 // --- Prometheus metrics (observability from day 1) ---
 const register = new client.Registry();
 register.setDefaultLabels({ instance: INSTANCE });
@@ -32,6 +50,23 @@ const httpHistogram = new client.Histogram({
   buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5],
   registers: [register],
 });
+const cacheHits = new client.Counter({
+  name: 'cache_hits_total',
+  help: 'Number of Redis cache hits',
+  registers: [register],
+});
+const cacheMisses = new client.Counter({
+  name: 'cache_misses_total',
+  help: 'Number of Redis cache misses (or Redis unavailable fallbacks)',
+  registers: [register],
+});
+
+// In-process counters for /cache eyeball endpoint (mirrors Prometheus counters).
+let hitCount = 0;
+let missCount = 0;
+
+const CACHE_KEY = 'items:latest100';
+const CACHE_TTL = 30; // seconds
 
 async function initDb(): Promise<void> {
   await writePool.query(`
@@ -84,9 +119,35 @@ app.get('/work', async (req) => {
 });
 
 app.get('/items', async () => {
+  // Cache-aside: try Redis first (only when REDIS_URL is configured).
+  if (redis) {
+    try {
+      const cached = await redis.get(CACHE_KEY);
+      if (cached !== null) {
+        cacheHits.inc();
+        hitCount++;
+        // instance is always current (not cached) so LB visibility is preserved.
+        return { instance: INSTANCE, items: JSON.parse(cached) };
+      }
+    } catch {
+      // Redis unavailable — fall through to DB, count as miss.
+    }
+    cacheMisses.inc();
+    missCount++;
+  }
+
   const { rows } = await readPool.query(
     'SELECT id, name, created_at FROM items ORDER BY id DESC LIMIT 100',
   );
+
+  if (redis) {
+    try {
+      await redis.set(CACHE_KEY, JSON.stringify(rows), 'EX', CACHE_TTL);
+    } catch {
+      // Best-effort write; ignore errors.
+    }
+  }
+
   return { instance: INSTANCE, items: rows };
 });
 
@@ -100,8 +161,33 @@ app.post('/items', async (req, reply) => {
     'INSERT INTO items(name) VALUES($1) RETURNING id, name, created_at',
     [body.name],
   );
+
+  // Invalidate the cache key after writing. NOTE: this is best-effort, not a
+  // correctness guarantee. Classic cache-aside race: a concurrent GET that read
+  // the DB *before* this INSERT can still SET its stale snapshot *after* this DEL,
+  // leaving stale data cached until the TTL expires. Under concurrent load this
+  // window is real — it's the invalidation trap this stage exists to show.
+  if (redis) {
+    try {
+      await redis.del(CACHE_KEY);
+    } catch {
+      // Best-effort invalidation; ignore errors.
+    }
+  }
+
   reply.code(201);
   return { instance: INSTANCE, item: rows[0] };
+});
+
+// Eyeball endpoint: quick check of cache efficiency for this process.
+app.get('/cache', async () => {
+  const total = hitCount + missCount;
+  return {
+    instance: INSTANCE,
+    hits: hitCount,
+    misses: missCount,
+    hit_ratio: total === 0 ? 0 : hitCount / total,
+  };
 });
 
 // Replication lag endpoint: only meaningful on a replica (primary returns null lag, which is normal).
@@ -120,7 +206,7 @@ app.get('/replication', async (_req, reply) => {
 app.get('/', async () => ({
   service: 'progressive-architecture-lab api',
   instance: INSTANCE,
-  endpoints: ['/health', '/ready', '/metrics', '/work?ms=&cpu=', 'GET/POST /items', '/replication'],
+  endpoints: ['/health', '/ready', '/metrics', '/work?ms=&cpu=', 'GET/POST /items', '/replication', '/cache'],
 }));
 
 async function main(): Promise<void> {
@@ -160,7 +246,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     app.log.info(`${sig} received, shutting down...`);
     try {
       await app.close();
-      await Promise.all([writePool.end(), readPool.end()]);
+      await Promise.all([writePool.end(), readPool.end(), ...(redis ? [redis.quit()] : [])]);
     } finally {
       process.exit(0);
     }
