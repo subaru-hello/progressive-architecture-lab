@@ -1,0 +1,13 @@
+# Caddy = リバースプロキシ / ロードバランサ。ホストの :8080 で受けて api レプリカ群へ振る。
+# Redis/DB には LB を置かない: キャッシュ制御はアプリ層で制御。
+:80 {
+	reverse_proxy {
+		dynamic a {
+			name api
+			port 3000
+			refresh 2s
+			resolvers 127.0.0.11
+		}
+		lb_policy round_robin
+	}
+}

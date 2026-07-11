@@ -21,3 +21,4 @@
 - [Lv5 — リードレプリカ + read/write 分離：壁は消えず「移動」する](05-lv5.md)
 - [Lv6 — Redis キャッシュ：read 負荷は「移す」でなく「消す」](06-lv6.md)
 - [Lv7 — worker_threads：CPU 律速の「回避」でなく「根治」（probe 雪崩を単一 replica で根治）](07-lv7.md)
+- [Lv8 — write-behind 非同期キュー：バッファであって乗数ではない（write の壁は消えない）](08-lv8.md)

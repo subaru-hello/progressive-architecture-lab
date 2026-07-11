@@ -57,6 +57,21 @@ if (REDIS_URL) {
   });
 }
 
+// --- Async write queue (optional write-behind layer, Lv8) ---
+// ASYNC_WRITE を設定しない compose (Lv0-7) では同期 INSERT+201 のまま（後方互換）。
+// ASYNC_WRITE が truthy かつ REDIS_URL 未設定は設定ミスなので即死させる。
+const ASYNC_WRITE = process.env.ASYNC_WRITE;
+if (ASYNC_WRITE && !REDIS_URL) {
+  throw new Error('ASYNC_WRITE requires REDIS_URL to be set');
+}
+// WRITE_QUEUE_MAX: 背圧しきい値。Stream depth がこれを超えると 503 を返す。
+// 未設定なら大きめの既定値 100000。floor at 1 でゼロ設定ガード。
+const WRITE_QUEUE_MAX = Math.max(
+  1,
+  Math.trunc(Number(process.env.WRITE_QUEUE_MAX ?? 100000)),
+);
+const STREAM_NAME = 'items:writes';
+
 // --- Prometheus metrics (observability from day 1) ---
 const register = new client.Registry();
 register.setDefaultLabels({ instance: INSTANCE });
@@ -86,6 +101,11 @@ const workerQueueDepth = new client.Gauge({
 const workerBusy = new client.Gauge({
   name: 'worker_pool_busy',
   help: 'Number of worker threads currently processing a job',
+  registers: [register],
+});
+const writeQueueDepth = new client.Gauge({
+  name: 'write_queue_depth',
+  help: 'Number of pending entries in the write-behind Redis Stream (items:writes)',
   registers: [register],
 });
 
@@ -132,6 +152,14 @@ app.get('/metrics', async (_req, reply) => {
   if (pool) {
     workerQueueDepth.set(pool.queueDepth);
     workerBusy.set(pool.busy);
+  }
+  if (ASYNC_WRITE && redis) {
+    try {
+      const depth = await redis.xlen(STREAM_NAME);
+      writeQueueDepth.set(depth);
+    } catch {
+      // Keep previous value; don't block metrics on Redis unavailability.
+    }
   }
   reply.header('Content-Type', register.contentType);
   return register.metrics();
@@ -198,6 +226,36 @@ app.post('/items', async (req, reply) => {
     reply.code(400);
     return { error: 'name is required' };
   }
+
+  // Lv8: ASYNC_WRITE パス — Redis Stream に enqueue して 202 で即返し。
+  // consumer プロセスが非同期に INSERT し、commit 後に cache DEL を行う。
+  if (ASYNC_WRITE && redis) {
+    // 背圧チェック: Stream depth がしきい値を超えたら 503 で拒否。
+    // XLEN 失敗（Redis 障害）も 503 で返す（フォールバックしない）。
+    let depth: number;
+    try {
+      depth = await redis.xlen(STREAM_NAME);
+    } catch {
+      reply.code(503);
+      return { error: 'write queue unavailable', instance: INSTANCE };
+    }
+    if (depth >= WRITE_QUEUE_MAX) {
+      reply.code(503);
+      return { error: 'write queue saturated', depth, instance: INSTANCE };
+    }
+    // XADD 失敗（Redis 障害）は同期 INSERT にフォールバックせず 503 で返す。
+    let streamId: string;
+    try {
+      streamId = await redis.xadd(STREAM_NAME, '*', 'name', body.name, 'enqueued_at', String(Date.now())) as string;
+    } catch {
+      reply.code(503);
+      return { error: 'write queue unavailable', instance: INSTANCE };
+    }
+    reply.code(202);
+    return { status: 'queued', stream_id: streamId, instance: INSTANCE };
+  }
+
+  // 同期パス (Lv0-7 互換): 同期 INSERT + 201 + cache DEL。
   const { rows } = await writePool.query(
     'INSERT INTO items(name) VALUES($1) RETURNING id, name, created_at',
     [body.name],
@@ -251,6 +309,24 @@ app.get('/', async () => ({
 }));
 
 async function main(): Promise<void> {
+  // ASYNC_WRITE パスでは Redis が write の必須依存になる。
+  // lazyConnect のまま最初のリクエストで接続しようとすると enableOfflineQueue:false が
+  // 邪魔して XLEN/XADD が 500 を返す（接続中にキューされないため）。
+  // 起動時に明示的に connect() してサーブ前に Redis 接続を確立する。
+  if (ASYNC_WRITE && redis) {
+    try {
+      await redis.connect();
+    } catch (err) {
+      // 「既に connecting/connected」の良性 reject だけ握る。Redis が本当に未達なら
+      // fail-fast する。ASYNC_WRITE では Redis が write の本線なので、繋がらないまま
+      // listen すると /ready は green のまま全 POST が 503 になる（write-dead な緑）。
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/already (connect|connecting|connected)/i.test(msg)) {
+        throw new Error(`ASYNC_WRITE: Redis connect failed: ${msg}`);
+      }
+    }
+  }
+
   // Postgres may still be booting when the API starts; retry init before serving.
   for (let attempt = 1; ; attempt++) {
     try {

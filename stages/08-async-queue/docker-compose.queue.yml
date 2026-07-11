@@ -1,0 +1,95 @@
+# Lv8 フェーズB — Redis Stream write-behind キューで write を非同期化する。
+#   caddy(:8080) --> api x4 --> redis (Stream) --> consumer --> db
+#
+# 狙い: ASYNC_WRITE=1 で POST /items を 202 即返しに切り替える。
+#       consumer がバックグラウンドで Stream を drain して Postgres に INSERT。
+#       write p95 は激減するが depth（積み上がり）と lag（DB commit までの時間）に
+#       負債が溜まる——バッファであって乗数でない点を観測するのが核心。
+#       consumer replicas を 1→2 に増やすと drain が追いつく。
+#
+# 観測:
+#   curl -s localhost:8080/metrics | grep write_queue_depth
+#   curl -s localhost:3001/metrics | grep write_queue_commit_lag_seconds
+#
+# 起動: docker compose -f stages/08-async-queue/docker-compose.queue.yml up --build -d
+# 負荷: docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6 run - < load/write-heavy.js
+name: pal-lv8-queue
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pal
+      POSTGRES_PASSWORD: pal
+      POSTGRES_DB: pal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # AOF 永続化: コンテナ再起動後も未 ACK エントリを復元できる（教材ポイント）。
+    # AOF off + XADD 前 crash で消えるデモは README 参照。
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      REDIS_URL: redis://redis:6379
+      ASYNC_WRITE: "1"
+      WRITE_QUEUE_MAX: "100000"
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    expose:
+      - "3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 4
+
+  consumer:
+    build: ../../app
+    # Dockerfile の CMD を上書きして consumer.js を起動。
+    command: ["node", "dist/consumer.js"]
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      REDIS_URL: redis://redis:6379
+      CONSUMER_CONCURRENCY: "10"
+      CONSUMER_PORT: "3001"
+    # expose（host バインドしない）にしておくと `--scale consumer=2` でポート衝突しない。
+    # host から lag metrics を見るときは compose 経由で:
+    #   docker compose -f ... exec consumer wget -qO- localhost:3001/metrics | grep write_queue
+    expose:
+      - "3001"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
