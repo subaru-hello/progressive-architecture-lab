@@ -1,0 +1,99 @@
+# Lv10 — batched commit（Lv9）はそのまま、write セッションの synchronous_commit を off にする。
+#   caddy(:8080) --> api x4 --> redis (Stream) --> consumer(batched, sync_commit=off) --> db
+#
+# 狙い: Lv9 で「律速は commit の回数（fsync 固定費）」と分かった。Lv10 は fsync を正面から攻める。
+#       consumer は multi-row INSERT のまま SYNC_COMMIT_OFF=1 で synchronous_commit=off にし、
+#       commit が WAL の fsync 完了を待たずに返るようにする＝commit「コスト」を削る。
+#       A/B: stage09（batched, sync_commit=on）↔ stage10（batched, sync_commit=off）を
+#       同じ 1 consumer・同じ負荷で回し、飽和時の drain throughput / depth / 503 / lag を比較する。
+#       代償: OS/DB クラッシュで直近数百 ms 分の commit 済みトランザクションが失われうる（WAL 未 flush）。
+#
+# 観測:
+#   depth: curl -s localhost:8080/metrics | grep write_queue_depth
+#   commit lag + batch size: docker compose -f stages/10-sync-commit/docker-compose.queue.yml \
+#     exec consumer wget -qO- localhost:3001/metrics | grep write_queue
+#
+# 起動: docker compose -f stages/10-sync-commit/docker-compose.queue.yml up --build -d
+# 負荷: docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 -e PEAK_VUS=800 grafana/k6 run - < load/write-heavy.js
+name: pal-lv10-synccommit
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pal
+      POSTGRES_PASSWORD: pal
+      POSTGRES_DB: pal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # AOF 永続化: コンテナ再起動後も未 ACK エントリを復元できる（教材ポイント）。
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      REDIS_URL: redis://redis:6379
+      ASYNC_WRITE: "1"
+      WRITE_QUEUE_MAX: "100000"
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    expose:
+      - "3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 4
+
+  consumer:
+    build: ../../app
+    # Dockerfile の CMD を上書きして consumer.js を起動。
+    command: ["node", "dist/consumer.js"]
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      REDIS_URL: redis://redis:6379
+      CONSUMER_CONCURRENCY: "10"
+      CONSUMER_PORT: "3001"
+      BATCH_WRITES: "1"
+      WRITE_BATCH_SIZE: "100"
+      # Lv10 の肝: write セッションだけ synchronous_commit=off（fsync 待ちを外す）。
+      SYNC_COMMIT_OFF: "1"
+    # expose（host バインドしない）で `--scale consumer=2` でもポート衝突しない。
+    #   docker compose -f stages/10-sync-commit/docker-compose.queue.yml exec consumer wget -qO- localhost:3001/metrics | grep write_queue
+    expose:
+      - "3001"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

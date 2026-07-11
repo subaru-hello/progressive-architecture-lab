@@ -23,3 +23,4 @@
 - [Lv7 — worker_threads：CPU 律速の「回避」でなく「根治」（probe 雪崩を単一 replica で根治）](07-lv7.md)
 - [Lv8 — write-behind 非同期キュー：バッファであって乗数ではない（write の壁は消えない）](08-lv8.md)
 - [Lv9 — INSERT バッチ化：律速は行数でなく commit 回数（consumer 1 のまま drain 6.4×）](09-lv9.md)
+- [Lv10 — synchronous_commit=off：commit の cost を削る（回数削減には敵わない・durability を払う）](10-lv10.md)

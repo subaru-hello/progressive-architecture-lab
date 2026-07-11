@@ -34,6 +34,11 @@ const INSTANCE = process.env.INSTANCE_ID ?? os.hostname();
 const BATCH_WRITES = process.env.BATCH_WRITES === '1';
 // BATCH_WRITES on のときの XREADGROUP COUNT。off のときは CONSUMER_CONCURRENCY を使う（後方互換）。
 const WRITE_BATCH_SIZE = Math.max(1, Math.trunc(Number(process.env.WRITE_BATCH_SIZE ?? 100)));
+// SYNC_COMMIT_OFF=1 で write セッションの synchronous_commit を off にする（Lv10）。未設定なら
+// Lv9 と同一（既定 on）。commit が WAL の fsync 完了を待たずに返る＝commit「コスト」を削る。
+// 代償: OS/DB クラッシュで直近数百 ms 分の commit 済みトランザクションが失われうる（WAL 未 flush）。
+// ※ ロスト範囲は wal_writer_delay（既定 200ms）程度。データ「破損」ではなく最新分の消失。
+const SYNC_COMMIT_OFF = process.env.SYNC_COMMIT_OFF === '1';
 
 // Consumer name must be unique per process so multiple replicas don't clash in the group.
 const CONSUMER_NAME = `consumer-${os.hostname()}-${process.pid}`;
@@ -45,7 +50,15 @@ const CACHE_KEY = 'items:latest100';
 // XACK 前）のエントリを XAUTOCLAIM が奪い返して再 INSERT し、定常状態でも重複が増える。
 const AUTOCLAIM_IDLE_MS = 60000;
 
-const writePool = new Pool({ connectionString: DATABASE_URL, max: 5 });
+// SYNC_COMMIT_OFF のときは libpq の startup option で接続時点から synchronous_commit=off を効かせる。
+// `options: '-c synchronous_commit=off'` は各物理接続の確立時にサーバへ渡るので、pool.on('connect')
+// で SET を撃つ方式のような「SET 完了前に最初のクエリが走る」レースが原理的に無い。
+// write 経路（この consumer の writePool）だけに効き、read 経路（api 側 readPool）には影響しない。
+const writePool = new Pool({
+  connectionString: DATABASE_URL,
+  max: 5,
+  ...(SYNC_COMMIT_OFF ? { options: '-c synchronous_commit=off' } : {}),
+});
 
 const redis = new Redis(REDIS_URL, {
   lazyConnect: true,
@@ -414,6 +427,10 @@ async function main(): Promise<void> {
   await ensureGroup();
 
   console.log(`[consumer] ${CONSUMER_NAME} starting on group=${GROUP_NAME} stream=${STREAM_NAME}`);
+  console.log(
+    `[consumer] mode: BATCH_WRITES=${BATCH_WRITES} WRITE_BATCH_SIZE=${WRITE_BATCH_SIZE} ` +
+      `synchronous_commit=${SYNC_COMMIT_OFF ? 'off' : 'on'}`,
+  );
 
   // metrics server 起動。
   await metricsApp.listen({ port: CONSUMER_PORT, host: '0.0.0.0' });
