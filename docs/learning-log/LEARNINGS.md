@@ -3,7 +3,7 @@
 各段の詳細ログ（`NN-*.md`）から、**転用できる教訓だけ**を抜き出して蓄積するファイル。
 段を進めるたびにここへ追記する。各項目に出所の段を `[Lv?]` で付す。
 
-最終更新: 2026-07-10（Lv6 — Redis キャッシュまで）
+最終更新: 2026-07-11（Lv9 — INSERT バッチ化まで）
 
 ---
 
@@ -173,6 +173,25 @@ XADD（Redis への追記）は INSERT（DB commit/fsync）より桁違いに軽
 （producer が抜く）。drain 容量を sustained write レートに合わせる（consumer 増設 or multi-row INSERT/COPY）のが本質。
 「キューを挟めば write がスケールする」は幻想——キューは latency を切り離す道具で、throughput を増やす道具ではない。
 
+## 28. ⭐ DB write の律速は「INSERT の行数」でなく「commit の回数」 `[Lv8→Lv9]`
+Lv8 の consumer は N 件まとめて読んでも 1件ずつ INSERT+commit していた。これを **1本の multi-row INSERT
+（`VALUES ($1),($2),...`）= 1 commit** に束ねると、consumer 数を 1 に固定したまま drain throughput が **6.4×**
+（45,153→288,969 行）、平均 batch 32.9 行/commit、commit lag ~55s→~20ms。飽和して write の 54.84% を 503 で
+弾いていたキュー（depth 100k 張り付き）が、depth ほぼ 0（ピーク 283）・**503 ゼロ**で流れるキューに変わった。
+効くのは **commit の固定費（fsync/WAL flush/トランザクション）が行数でなく回数に比例する**から——33 行分の固定費を 1 回に畳む。
+Lv8 教訓27「enqueue は INSERT より桁違いに軽い」と同じ構図が INSERT の中にもあった。**律速の単位を疑え（行 vs commit）。**
+ただし代償: poison batch も shutdown 取りこぼしも **増幅係数 = batch size**（1 失敗が最大 batch size 件の巻き添え）＝
+耐障害性の粒度を粗くする。また write p95 は per-row 67.7ms < batched 75.5ms に見えるが、per-row の値は受理された 45%
+のみ（残り 55% は 503 即弾き）——**エラー率を見ないと latency に騙される**（Lv3 の再演）。
+
+## 29. pipeline の「成功」を戻り値まで見ないと不変量が静かに壊れる `[Lv9]`
+ioredis の `pipeline.exec()` は**個別コマンドのエラーでは reject せず** `[err, result]` の配列で resolve する
+（reject は接続断など transport レベルのみ）。`await pipe.exec()` を try/catch するだけでは一部の XDEL/XACK 失敗を
+取り逃し、「XACK 済みだが XDEL 未」= XLEN 恒久リークや重複再 INSERT が **warn すら出ず不可視**で進む。
+逐次 await（per-row の `ackAndDelete`）なら各コマンドのエラーが自然に catch されるが、まとめて速くした瞬間に
+このエラー可視性が抜ける。**バッチ化・pipeline 化は throughput と引き換えにエラーの粒度と可視性を失いやすい**
+——戻り値配列を必ず走査する。
+
 ---
 
 ## メタな学び
@@ -182,3 +201,4 @@ XADD（Redis への追記）は INSERT（DB commit/fsync）より桁違いに軽
 ## 一言サマリ
 > スケール = 多コアを使うこと。手段は言語かレプリカ。
 > ただし計測はエラー率まで見ないと騙され、k8s では probe が飽和時に牙をむく。
+> そして DB write は「行数」でなく「commit 回数」で詰まる——バッチ化は速さと引き換えに障害の粒度を粗くする。
