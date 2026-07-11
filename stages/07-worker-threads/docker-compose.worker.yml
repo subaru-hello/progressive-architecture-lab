@@ -1,0 +1,55 @@
+# Lv7 フェーズB — worker_threads による CPU offload。
+#   caddy(:8080) --> api x1 (worker pool 4 threads) --> db
+#
+# 狙い: /work?cpu=N を worker thread に offload し、イベントループを解放する。
+#       /health は常に即応。キューが詰まると /work は 503（背圧）で返す。
+#       WORKER_POOL_SIZE: "4" → コア数に応じて調整可（例: 8コアなら "6"）。
+#       replicas: 1 のまま → 追加レプリカでなく "スレッド内並列" で解決する点が核心。
+#
+# 起動: docker compose -f stages/07-worker-threads/docker-compose.worker.yml up --build -d
+# 負荷: docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6 run - < load/cpu-vs-health.js
+name: pal-lv7-worker
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pal
+      POSTGRES_PASSWORD: pal
+      POSTGRES_DB: pal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      # WORKER_POOL_SIZE: CPU バーンを worker thread に offload するスレッド数。
+      # コンテナに割り当てたコア数に応じて調整（例: 8コアなら "6"）。
+      WORKER_POOL_SIZE: "4"
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    expose:
+      - "3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

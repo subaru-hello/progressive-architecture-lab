@@ -1,0 +1,52 @@
+# Lv7 フェーズA — 「同期バーン」の壁を再現する。
+#   caddy(:8080) --> api x1 --> db
+#
+# 狙い: /work?cpu=N がイベントループをブロックしたまま同居する /health に届かない。
+#       WORKER_POOL_SIZE を渡さない → 同期パス（Lv0-6 互換）。
+#       replicas: 1 で単一プロセスの飢えを純粋に見せる。
+#
+# 起動: docker compose -f stages/07-worker-threads/docker-compose.wall.yml up --build -d
+# 負荷: docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6 run - < load/cpu-vs-health.js
+name: pal-lv7-wall
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pal
+      POSTGRES_PASSWORD: pal
+      POSTGRES_DB: pal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      # WORKER_POOL_SIZE not set → 同期パス（=壁）。/work がイベントループをブロックする。
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    expose:
+      - "3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

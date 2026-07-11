@@ -3,6 +3,7 @@ import os from 'node:os';
 import pg from 'pg';
 import client from 'prom-client';
 import { Redis } from 'ioredis';
+import { WorkerPool } from './pool.js';
 
 const { Pool } = pg;
 
@@ -21,6 +22,23 @@ const readPool = new Pool({
   connectionString: process.env.DATABASE_URL_RO ?? process.env.DATABASE_URL,
   max: Number(process.env.PG_POOL_MAX_RO ?? process.env.PG_POOL_MAX ?? 10),
 });
+
+// --- Worker thread pool (optional CPU offload layer) ---
+// WORKER_POOL_SIZE を設定しない compose (Lv0-6) では pool は null のまま → 同期パス継続。
+// WORKER_POOL_SIZE unset → pool stays null → /work runs the synchronous path
+// (Lv0–6 behavior, unchanged). A non-positive/garbage value would build an empty
+// pool that queues forever and 503s everything, so validate it up front.
+const poolSize = Math.trunc(Number(process.env.WORKER_POOL_SIZE));
+let pool: WorkerPool | null = null;
+if (poolSize > 0) {
+  pool = new WorkerPool(poolSize, new URL('./cpu-worker.js', import.meta.url));
+}
+// Backpressure bound. Default: 100 jobs per worker. Floor at 1 so a stray
+// WORKER_QUEUE_MAX="0" can't turn every /work into an instant 503.
+const WORKER_QUEUE_MAX = Math.max(
+  1,
+  Math.trunc(Number(process.env.WORKER_QUEUE_MAX ?? poolSize * 100)),
+);
 
 // --- Redis (optional cache layer) ---
 // REDIS_URL を設定しない compose (Lv0-5) では redis 変数は null のまま。
@@ -58,6 +76,16 @@ const cacheHits = new client.Counter({
 const cacheMisses = new client.Counter({
   name: 'cache_misses_total',
   help: 'Number of Redis cache misses (or Redis unavailable fallbacks)',
+  registers: [register],
+});
+const workerQueueDepth = new client.Gauge({
+  name: 'worker_pool_queue_depth',
+  help: 'Number of jobs waiting in the worker pool queue',
+  registers: [register],
+});
+const workerBusy = new client.Gauge({
+  name: 'worker_pool_busy',
+  help: 'Number of worker threads currently processing a job',
   registers: [register],
 });
 
@@ -101,6 +129,10 @@ app.get('/ready', async (_req, reply) => {
 });
 
 app.get('/metrics', async (_req, reply) => {
+  if (pool) {
+    workerQueueDepth.set(pool.queueDepth);
+    workerBusy.set(pool.busy);
+  }
   reply.header('Content-Type', register.contentType);
   return register.metrics();
 });
@@ -108,11 +140,20 @@ app.get('/metrics', async (_req, reply) => {
 // Work simulator: create latency (ms) and/or CPU load (cpu) to drive scaling experiments.
 //   GET /work?ms=50        -> 50ms of I/O-ish wait
 //   GET /work?cpu=20       -> ~20M sqrt iterations of CPU burn
-app.get('/work', async (req) => {
+//   WORKER_POOL_SIZE が設定されている場合は cpu > 0 のジョブを worker thread に offload。
+app.get('/work', async (req, reply) => {
   const q = req.query as { ms?: string; cpu?: string };
   const ms = Number(q.ms ?? 0);
   const cpu = Number(q.cpu ?? 0);
   if (ms > 0) await new Promise((r) => setTimeout(r, ms));
+  if (pool && cpu > 0) {
+    if (pool.queueDepth >= WORKER_QUEUE_MAX) {
+      reply.code(503);
+      return { error: 'worker pool saturated', queueDepth: pool.queueDepth, instance: INSTANCE };
+    }
+    const { sum } = await pool.run({ cpu });
+    return { instance: INSTANCE, ms, cpu, sum, offloaded: true };
+  }
   let sum = 0;
   for (let i = 0; i < cpu * 1_000_000; i++) sum += Math.sqrt(i);
   return { instance: INSTANCE, ms, cpu, sum };
@@ -246,7 +287,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     app.log.info(`${sig} received, shutting down...`);
     try {
       await app.close();
-      await Promise.all([writePool.end(), readPool.end(), ...(redis ? [redis.quit()] : [])]);
+      await Promise.all([writePool.end(), readPool.end(), ...(redis ? [redis.quit()] : []), ...(pool ? [pool.destroy()] : [])]);
     } finally {
       process.exit(0);
     }
