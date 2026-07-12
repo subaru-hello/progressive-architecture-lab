@@ -1,0 +1,49 @@
+# Lv13 — monolith：items+orders+users を 1 プロセスに同居。cross-context は「直 SQL JOIN」。
+#   caddy 不要。api(:3000) 1 本 --> db(共有 Postgres) 1 本。
+#
+# 狙い（分解軸のベースライン）:
+#   ORDERS_CROSS_CONTEXT=join なので POST /orders は orders が items テーブルを
+#   直接 JOIN/UPDATE して在庫を引く（= schema 結合・全ドメインが 1 DB を共有）。
+#   in-process なので order 作成の latency は最小。ここを基準に Lv14/15 の税を測る。
+#
+# 起動: docker compose -f stages/13-monolith/docker-compose.yml up --build -d
+# 疎通: TOKEN=demo-token-1;
+#   curl -s localhost:3000/items                                   # 既存と同じ list
+#   curl -s -XPOST localhost:3000/items -H 'content-type: application/json' -d '{"name":"widget"}'
+#   curl -s -XPOST localhost:3000/orders -H "x-auth-token: $TOKEN" -H 'content-type: application/json' -d '{"itemId":1,"qty":1}'
+#   curl -s localhost:3000/items/1                                 # stock が減っている
+# 負荷: docker run --rm -i -e BASE_URL=http://host.docker.internal:3000 grafana/k6 run - < load/orders.js
+name: pal-lv13
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pal
+      POSTGRES_PASSWORD: pal
+      POSTGRES_DB: pal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      SERVICE: all
+      ORDERS_CROSS_CONTEXT: join
+      SEED_DEMO: "1"          # 分解ステージだけデモ items(在庫)+users を seed。旧 Lv0-12 は seed しない。
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

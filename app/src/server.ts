@@ -4,12 +4,31 @@ import pg from 'pg';
 import client from 'prom-client';
 import { Redis } from 'ioredis';
 import { WorkerPool } from './pool.js';
+import { itemsRoutes, STREAM_NAME } from './domains/items/routes.js';
+import { usersRoutes } from './domains/users/routes.js';
+import { ordersRoutes } from './domains/orders/routes.js';
+import { initSchema as itemsInitSchema, seed as itemsSeed } from './domains/items/repo.js';
+import { initSchema as usersInitSchema, seed as usersSeed } from './domains/users/repo.js';
+import { initSchema as ordersInitSchema } from './domains/orders/repo.js';
+import { InProcessItemsAdapter, HttpItemsAdapter } from './ports/items-port.js';
+import { InProcessUsersAdapter, HttpUsersAdapter } from './ports/users-port.js';
 
 const { Pool } = pg;
 
 const PORT = Number(process.env.PORT ?? 3000);
 // INSTANCE_ID lets us SEE which replica/pod served a request (great for watching load balancing).
 const INSTANCE = process.env.INSTANCE_ID ?? os.hostname();
+
+// SERVICE: どのドメインをこのプロセスがホストするか。
+// SERVICE: which domain(s) this process hosts (default 'all' = monolith).
+const SERVICE = process.env.SERVICE ?? 'all';
+
+// ORDERS_CROSS_CONTEXT: orders が items テーブルに直接 JOIN するか Port 経由か。
+// ORDERS_CROSS_CONTEXT: whether orders accesses items via direct SQL ('join') or port ('port').
+const ORDERS_CROSS_CONTEXT = (process.env.ORDERS_CROSS_CONTEXT ?? 'join') as 'join' | 'port';
+
+const ITEMS_SERVICE_URL = process.env.ITEMS_SERVICE_URL;
+const USERS_SERVICE_URL = process.env.USERS_SERVICE_URL;
 
 const writePool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -64,13 +83,28 @@ const ASYNC_WRITE = process.env.ASYNC_WRITE;
 if (ASYNC_WRITE && !REDIS_URL) {
   throw new Error('ASYNC_WRITE requires REDIS_URL to be set');
 }
+
+// SEED_DEMO: 未設定（デフォルト）はシードなし → 旧ステージ（Lv0-12）の空リスト基準を維持。
+// SEED_DEMO unset (default) → no seeding → old-stage empty-list baseline is preserved.
+// New Lv13+ composes set SEED_DEMO=1 to populate demo data.
+const SEED_DEMO = process.env.SEED_DEMO;
+
+// join モード + HTTP サービス URL は設定ミス: items テーブルが同一 DB に無い前提で
+// 直接 SQL を打つと全 order が 500 になる → 起動時に即死させる。
+// join mode + HTTP service URL is a misconfiguration: direct SQL against items table
+// will always fail when items runs as a separate service → fail fast at boot.
+if (ORDERS_CROSS_CONTEXT === 'join' && (ITEMS_SERVICE_URL || USERS_SERVICE_URL)) {
+  throw new Error(
+    'ORDERS_CROSS_CONTEXT=join is incompatible with ITEMS_SERVICE_URL / USERS_SERVICE_URL. ' +
+    'Use ORDERS_CROSS_CONTEXT=port for microservice deployments.',
+  );
+}
 // WRITE_QUEUE_MAX: 背圧しきい値。Stream depth がこれを超えると 503 を返す。
 // 未設定なら大きめの既定値 100000。floor at 1 でゼロ設定ガード。
 const WRITE_QUEUE_MAX = Math.max(
   1,
   Math.trunc(Number(process.env.WRITE_QUEUE_MAX ?? 100000)),
 );
-const STREAM_NAME = 'items:writes';
 
 // --- Prometheus metrics (observability from day 1) ---
 const register = new client.Registry();
@@ -110,24 +144,14 @@ const writeQueueDepth = new client.Gauge({
 });
 
 // In-process counters for /cache eyeball endpoint (mirrors Prometheus counters).
-let hitCount = 0;
-let missCount = 0;
-
-const CACHE_KEY = 'items:latest100';
-const CACHE_TTL = 30; // seconds
-
-async function initDb(): Promise<void> {
-  await writePool.query(`
-    CREATE TABLE IF NOT EXISTS items (
-      id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
-}
+// オブジェクト経由で渡すことで itemsRoutes プラグインが参照を共有できる。
+// Passed as object so itemsRoutes plugin shares the same reference.
+const cacheCounters = { hits: 0, misses: 0 };
 
 const app = Fastify({ logger: true });
 
+// onResponse フックは全ルートに適用されるよう、プラグイン登録より前に addHook する。
+// Register onResponse before plugins so it covers all domain routes too.
 app.addHook('onResponse', async (req, reply) => {
   const route = req.routeOptions?.url ?? req.url;
   httpHistogram.labels(req.method, route, String(reply.statusCode)).observe(reply.elapsedTime / 1000);
@@ -187,108 +211,6 @@ app.get('/work', async (req, reply) => {
   return { instance: INSTANCE, ms, cpu, sum };
 });
 
-app.get('/items', async () => {
-  // Cache-aside: try Redis first (only when REDIS_URL is configured).
-  if (redis) {
-    try {
-      const cached = await redis.get(CACHE_KEY);
-      if (cached !== null) {
-        cacheHits.inc();
-        hitCount++;
-        // instance is always current (not cached) so LB visibility is preserved.
-        return { instance: INSTANCE, items: JSON.parse(cached) };
-      }
-    } catch {
-      // Redis unavailable — fall through to DB, count as miss.
-    }
-    cacheMisses.inc();
-    missCount++;
-  }
-
-  const { rows } = await readPool.query(
-    'SELECT id, name, created_at FROM items ORDER BY id DESC LIMIT 100',
-  );
-
-  if (redis) {
-    try {
-      await redis.set(CACHE_KEY, JSON.stringify(rows), 'EX', CACHE_TTL);
-    } catch {
-      // Best-effort write; ignore errors.
-    }
-  }
-
-  return { instance: INSTANCE, items: rows };
-});
-
-app.post('/items', async (req, reply) => {
-  const body = req.body as { name?: string };
-  if (!body?.name) {
-    reply.code(400);
-    return { error: 'name is required' };
-  }
-
-  // Lv8: ASYNC_WRITE パス — Redis Stream に enqueue して 202 で即返し。
-  // consumer プロセスが非同期に INSERT し、commit 後に cache DEL を行う。
-  if (ASYNC_WRITE && redis) {
-    // 背圧チェック: Stream depth がしきい値を超えたら 503 で拒否。
-    // XLEN 失敗（Redis 障害）も 503 で返す（フォールバックしない）。
-    let depth: number;
-    try {
-      depth = await redis.xlen(STREAM_NAME);
-    } catch {
-      reply.code(503);
-      return { error: 'write queue unavailable', instance: INSTANCE };
-    }
-    if (depth >= WRITE_QUEUE_MAX) {
-      reply.code(503);
-      return { error: 'write queue saturated', depth, instance: INSTANCE };
-    }
-    // XADD 失敗（Redis 障害）は同期 INSERT にフォールバックせず 503 で返す。
-    let streamId: string;
-    try {
-      streamId = await redis.xadd(STREAM_NAME, '*', 'name', body.name, 'enqueued_at', String(Date.now())) as string;
-    } catch {
-      reply.code(503);
-      return { error: 'write queue unavailable', instance: INSTANCE };
-    }
-    reply.code(202);
-    return { status: 'queued', stream_id: streamId, instance: INSTANCE };
-  }
-
-  // 同期パス (Lv0-7 互換): 同期 INSERT + 201 + cache DEL。
-  const { rows } = await writePool.query(
-    'INSERT INTO items(name) VALUES($1) RETURNING id, name, created_at',
-    [body.name],
-  );
-
-  // Invalidate the cache key after writing. NOTE: this is best-effort, not a
-  // correctness guarantee. Classic cache-aside race: a concurrent GET that read
-  // the DB *before* this INSERT can still SET its stale snapshot *after* this DEL,
-  // leaving stale data cached until the TTL expires. Under concurrent load this
-  // window is real — it's the invalidation trap this stage exists to show.
-  if (redis) {
-    try {
-      await redis.del(CACHE_KEY);
-    } catch {
-      // Best-effort invalidation; ignore errors.
-    }
-  }
-
-  reply.code(201);
-  return { instance: INSTANCE, item: rows[0] };
-});
-
-// Eyeball endpoint: quick check of cache efficiency for this process.
-app.get('/cache', async () => {
-  const total = hitCount + missCount;
-  return {
-    instance: INSTANCE,
-    hits: hitCount,
-    misses: missCount,
-    hit_ratio: total === 0 ? 0 : hitCount / total,
-  };
-});
-
 // Replication lag endpoint: only meaningful on a replica (primary returns null lag, which is normal).
 app.get('/replication', async (_req, reply) => {
   try {
@@ -307,6 +229,66 @@ app.get('/', async () => ({
   instance: INSTANCE,
   endpoints: ['/health', '/ready', '/metrics', '/work?ms=&cpu=', 'GET/POST /items', '/replication', '/cache'],
 }));
+
+// --- ドメインルートの登録（SERVICE env で制御）---
+// --- Domain route registration (controlled by SERVICE env) ---
+const loadItems = SERVICE === 'all' || SERVICE === 'items';
+const loadUsers = SERVICE === 'all' || SERVICE === 'users';
+const loadOrders = SERVICE === 'all' || SERVICE === 'orders';
+
+if (loadItems) {
+  await app.register(itemsRoutes, {
+    writePool,
+    readPool,
+    redis,
+    INSTANCE,
+    ASYNC_WRITE,
+    WRITE_QUEUE_MAX,
+    cacheHits,
+    cacheMisses,
+    cacheCounters,
+  });
+}
+
+if (loadUsers) {
+  await app.register(usersRoutes, { writePool, INSTANCE });
+}
+
+if (loadOrders) {
+  // items ポートの選択: ITEMS_SERVICE_URL が設定されていれば HTTP アダプタ、なければインプロセス。
+  // Items port selection: HTTP adapter when ITEMS_SERVICE_URL is set, in-process otherwise.
+  const itemsPort = ITEMS_SERVICE_URL
+    ? new HttpItemsAdapter(ITEMS_SERVICE_URL)
+    : new InProcessItemsAdapter(writePool);
+
+  // users ポートの選択: USERS_SERVICE_URL が設定されていれば HTTP アダプタ、なければインプロセス。
+  // Users port selection: HTTP adapter when USERS_SERVICE_URL is set, in-process otherwise.
+  const usersPort = USERS_SERVICE_URL
+    ? new HttpUsersAdapter(USERS_SERVICE_URL)
+    : new InProcessUsersAdapter(writePool);
+
+  await app.register(ordersRoutes, {
+    ordersPool: writePool,
+    usersPort,
+    itemsPort,
+    mode: ORDERS_CROSS_CONTEXT,
+    INSTANCE,
+  });
+}
+
+async function initDb(): Promise<void> {
+  if (loadItems) {
+    await itemsInitSchema(writePool);
+    // SEED_DEMO が設定されている場合のみシード実行（旧ステージとの後方互換を守る）。
+    // Seed only when SEED_DEMO is set — preserves empty-list baseline for old stages.
+    if (SEED_DEMO) await itemsSeed(writePool);
+  }
+  if (loadUsers) {
+    await usersInitSchema(writePool);
+    if (SEED_DEMO) await usersSeed(writePool);
+  }
+  if (loadOrders) await ordersInitSchema(writePool);
+}
 
 async function main(): Promise<void> {
   // ASYNC_WRITE パスでは Redis が write の必須依存になる。
@@ -338,22 +320,28 @@ async function main(): Promise<void> {
       await new Promise((r) => setTimeout(r, 2000));
     }
   }
+
   // The CREATE TABLE above runs on writePool (primary). When readPool is a replica,
   // that DDL reaches it only after it streams over — so an early GET /items could hit
   // the replica before `items` exists and 500 (cold-start read-after-write). Wait until
   // the table is visible on readPool. When readPool == writePool (Lv0–4) this passes on
   // the first try. to_regclass returns NULL (not an error) when the table is absent.
-  for (let attempt = 1; ; attempt++) {
-    try {
-      const { rows } = await readPool.query(`SELECT to_regclass('public.items') AS t`);
-      if (rows[0].t) break;
-    } catch {
-      // fall through to retry (readPool/replica may not be reachable yet)
+  // items ドメインをロードしているときだけレプリカ可視性チェックを行う。
+  // Replica visibility check only when items domain is loaded.
+  if (loadItems) {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const { rows } = await readPool.query(`SELECT to_regclass('public.items') AS t`);
+        if (rows[0].t) break;
+      } catch {
+        // fall through to retry (readPool/replica may not be reachable yet)
+      }
+      if (attempt >= 30) throw new Error('items table not visible on readPool after 30 attempts');
+      app.log.warn(`readPool: waiting for items to replicate (attempt ${attempt}/30)...`);
+      await new Promise((r) => setTimeout(r, 1000));
     }
-    if (attempt >= 30) throw new Error('items table not visible on readPool after 30 attempts');
-    app.log.warn(`readPool: waiting for items to replicate (attempt ${attempt}/30)...`);
-    await new Promise((r) => setTimeout(r, 1000));
   }
+
   await app.listen({ port: PORT, host: '0.0.0.0' });
 }
 
