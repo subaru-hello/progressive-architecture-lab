@@ -1,0 +1,44 @@
+# Lv14 — modular monolith：Lv13 と同一トポロジ（1 プロセス・1 DB）。差は env 1 個だけ。
+#   ORDERS_CROSS_CONTEXT=port → orders は items テーブルを直接触らず、in-process の
+#   ItemsPort（関数呼び出し）越しに在庫を引く。プロセス境界は跨がないので latency は
+#   Lv13 とほぼ同一のはず。学びは「runtime 無料で schema 結合を切る」構造の話。
+#
+# 実演（docs 用）: items の内部 schema を変えても modular(port) は無傷／monolith(join,
+#   items テーブル直参照) だけ壊れる——この非対称が modular 化の対価回収。
+#
+# 起動: docker compose -f stages/14-modular-monolith/docker-compose.yml up --build -d
+# 疎通/負荷は Lv13 と同じ（:3000）。
+name: pal-lv14
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pal
+      POSTGRES_PASSWORD: pal
+      POSTGRES_DB: pal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      SERVICE: all
+      ORDERS_CROSS_CONTEXT: port      # ← Lv13 との唯一の差
+      SEED_DEMO: "1"          # 分解ステージだけデモ items(在庫)+users を seed。旧 Lv0-12 は seed しない。
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
