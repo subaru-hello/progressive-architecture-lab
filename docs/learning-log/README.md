@@ -24,3 +24,5 @@
 - [Lv8 — write-behind 非同期キュー：バッファであって乗数ではない（write の壁は消えない）](08-lv8.md)
 - [Lv9 — INSERT バッチ化：律速は行数でなく commit 回数（consumer 1 のまま drain 6.4×）](09-lv9.md)
 - [Lv10 — synchronous_commit=off：commit の cost を削る（回数削減には敵わない・durability を払う）](10-lv10.md)
+- [Lv11 — 並列 committer + group commit：durability を保ったまま fsync を束ねる（実装のみ・A/B 実測は延期）](11-lv11.md)
+- [Lv12 — scale-to-zero ↔ always-on：idle コストを cold-start latency に変換する](12-lv12.md)

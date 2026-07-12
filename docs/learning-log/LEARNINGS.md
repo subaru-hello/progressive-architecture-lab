@@ -214,6 +214,18 @@ GUI 負荷で load 30–48・SIP で Spotlight 停止も不可 → 高 ambient l
 焼き直し）、③単一ホスト・800VU の CPU 飽和下では fsync 節約分が CPU 争奪に食われて効果が出ない可能性（Lv3/Lv5 の罠）。
 → 詳細と実測手順は `docs/learning-log/11-lv11.md`。**load<5 の窓が取れ次第 A/B を回して数値を確定する。**
 
+## 32. ⭐ scale-to-zero は「idle コストを cold-start latency に変換する取引」— throughput は増えない `[Lv12]`
+serverless の肝＝scale-to-zero を KEDA http-add-on で k3d に再現（EKS 不使用）。always-on(HPA min=2) ↔
+scale-to-zero(min=0) を同一 image で背中合わせ実測: **cold-start 4,730ms vs 41ms（≈115×）**だが
+**warm 定常は完全一致**（両アーム 82.6 req/s・p95 ~26ms・503 ゼロ）。**払うのは idle 後の初回一発だけで、
+定常性能は一切犠牲にしない**。壁は消えず「idle 常駐コスト」→「初回 latency」へ移動する（Lv5「壁は移動する」/
+Lv8「latency 切り離し≠throughput 増」の系譜）。2つの副次学び: ①**cold-start はエラーでなく latency に出る** —
+interceptor が 0→1 の間リクエストをホールドするので burst でも 503 ゼロ（Lv2 の probe 事故＝502 高速返しの逆）。
+②**scale-to-zero はタダではない** — app Pod=0 でも KEDA 制御面が ~160Mi 常駐し、1 workload なら always-on の
+2 Pod(126Mi)より高い。idle 節約が黒字化するのは「制御面固定費 ÷ workload あたり節約」の損益分岐を超える
+workload 数から（＝散発アクセスの休眠 workload が多数あるほど効く。常時トラフィックの単一 workload には
+always-on が正解）。教訓6「数字は控除まで見ろ」の再演。※ Docker-Mac VM は cold-start が実機より膨れる（相対で読む）。
+
 ---
 
 ## メタな学び

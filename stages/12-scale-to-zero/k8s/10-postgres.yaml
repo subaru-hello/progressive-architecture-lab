@@ -1,0 +1,63 @@
+# Postgres は 1 レプリカ + PVC(local-path)。Lv3 と同一（不変）。
+# DB は scale-to-zero しない: 常時 1 で起こしておく。scale-to-zero するのは api だけ。
+# （DB を 0 に落とすと api の cold-start に DB 起動まで乗って一変数の実験にならない）
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pg-data
+  namespace: pal
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: pal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_USER, value: pal }
+            - { name: POSTGRES_PASSWORD, value: pal }
+            - { name: POSTGRES_DB, value: pal }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "pal", "-d", "pal"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pg-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: pal
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

@@ -1,0 +1,73 @@
+# api: Lv3 の Deployment+Service をそのまま流用（probe/requests.cpu=200m/topologySpread を継承）。
+# 差分は 2 点だけ:
+#   1) HPA を付けない。台数は KEDA の HTTPScaledObject(40-) が min=0..max=10 で管理する。
+#   2) replicas: 0 で apply する = 起動直後は Pod ゼロ（scale-to-zero の idle 状態）。
+#      最初のリクエストで KEDA interceptor が 0→1 を起こす。
+# image は Lv3 と実体同一（タグだけ lv12）。app は全段不変。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: pal
+spec:
+  replicas: 0 # KEDA が上書きして 0..10 で増減する。apply 直後の idle は 0 Pod。
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: api
+      containers:
+        - name: api
+          image: pal-api:lv12
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: DATABASE_URL, value: "postgres://pal:pal@postgres:5432/pal" }
+            - { name: PORT, value: "3000" }
+            - name: INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - containerPort: 3000
+          startupProbe:
+            httpGet: { path: /health, port: 3000 }
+            periodSeconds: 3
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /ready, port: 3000 }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /health, port: 3000 }
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: pal
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 3000

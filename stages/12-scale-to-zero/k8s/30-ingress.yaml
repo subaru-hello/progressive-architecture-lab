@@ -1,0 +1,27 @@
+# Ingress: host:8081 → Traefik → KEDA interceptor → (0→N) → api。Lv3 の :8081 パターンを踏襲。
+#
+# ポイント: backend は api Service ではなく **KEDA http-add-on の interceptor-proxy Service**。
+# interceptor が 0 検知でリクエストをホールドし replica≥1 を待って転送する（= cold-start が
+# 503 でなく「遅い 200」で出る）。api を直接指すと scale-to-zero が駆動されない。
+#
+# ⚠️ Ingress と backend Service は同一 namespace 必須 → この Ingress は interceptor のいる `keda`
+#    namespace に置く。interceptor の Service 名/port は chart バージョンで変わるので bring-up 時に
+#    `kubectl -n keda get svc | grep interceptor` で確認して合わせること（下記は keda-add-ons-http の慣例値）。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-scaletozero
+  namespace: keda
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: pal.localhost # HTTPScaledObject.spec.hosts と一致させる
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keda-add-ons-http-interceptor-proxy
+                port:
+                  number: 8080

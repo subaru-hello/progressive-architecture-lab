@@ -1,0 +1,39 @@
+# KEDA http-add-on の HTTPScaledObject。api Deployment を min=0..max=10 で HTTP リクエスト駆動スケール。
+# これが Lv12 の肝: minReplicaCount=0 → idle で Pod ゼロ、リクエストで interceptor が 0→1 を起こす。
+#
+# ⚠️ スキーマは http-add-on のバージョンで変わる（この段の最頻の詰まりどころ）。以下は v0.8.x 系の形。
+#    bring-up 時に `kubectl explain httpscaledobject.spec` で実物に合わせて微修正すること。
+#    - 旧 (v0.5 前後): spec.scaleTargetRef.{deployment,service,port} + spec.targetPendingRequests(top-level)
+#    - 新 (v0.8+):     spec.scaleTargetRef.{name,service,port} + spec.replicas.{min,max}
+#                      + spec.scaledownPeriod + spec.scalingMetric.requestRate
+apiVersion: http.keda.sh/v1alpha1
+kind: HTTPScaledObject
+metadata:
+  name: api
+  namespace: pal
+spec:
+  # interceptor はこの Host 宛のトラフィックだけを api にルートしスケールを駆動する。
+  # k6/curl 側は `Host: pal.localhost` を必ず付ける。Ingress の Host とも一致させる（不一致で 404/503）。
+  hosts:
+    - pal.localhost
+  scaleTargetRef:
+    name: api # Deployment 名
+    kind: Deployment
+    apiVersion: apps/v1
+    service: api # app Service 名
+    port: 80 # app Service の port
+  replicas:
+    min: 0 # ← scale-to-zero。idle で Pod ゼロ。
+    max: 10
+  # idle 判定してから 0 に落とすまでの猶予（秒）。短いと burst 直後に落として flapping、
+  # 長いと idle コストが残る。
+  # ※ 実測メモ: 実質の idle→0 時間 ≒ requestRate.window + scaledownPeriod。requestRate は window で
+  #   rate を平均するので、最後のリクエストから window ぶん rate が減衰 → その後 scaledownPeriod。
+  #   scaledownPeriod=60 + window=1m だと idle→0 に ~120s かかった。cold-start サンプルを速く回すため
+  #   両方短くする（idle→0 ≒ 45s）。production では flapping 回避のため長めに戻す。
+  scaledownPeriod: 15
+  scalingMetric:
+    requestRate:
+      granularity: 1s
+      targetValue: 100
+      window: 30s
