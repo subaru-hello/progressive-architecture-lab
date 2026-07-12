@@ -203,6 +203,17 @@ per-row（fsync 未 amortize）で sync-off は drain +52%、batched（既に 59
 「ボトルネックがまだそこに残っているか」で決まる**（教訓26 の再演）。なお単一 committer では commit_delay（group commit）は
 効かない——fsync をまとめるには並列 committer が要る。代償は durability: クラッシュで直近数百 ms 分の commit 済みが消えうる（Lv8 の 202≠永続化の系譜）。
 
+## 31. ⏳ 未実測 — group commit は「durability を保ったまま fsync を束ねる」手だが、並列 committer が要る `[Lv11]`
+Lv10 で「単一 committer では commit_delay（group commit）が効かない／sync-off は durability と引き換え」と分かった。
+Lv11 はその宿題: **synchronous_commit=on のまま**、consumer 内に N 本の committer coroutine を並行させ（各々専用の
+read コネクション）、複数 commit を WAL flush 点に同時到達させて **1 fsync に束ねる**（`commit_delay`/`commit_siblings`）。
+狙いは「durability を落とさず fsync を amortize」。**実測は未実施**（記録日はマシンが Spotlight 再インデックス＋
+GUI 負荷で load 30–48・SIP で Spotlight 停止も不可 → 高 ambient load 下では単一 consumer の commit 挙動が CPU 争奪に
+埋もれ group commit の効果が測れないため延期）。検証すべき仮説: ①並列 committer で commit_delay が発火するか、
+②「committer 並列のみ(commit_delay=0)」との差分で group commit の**純効果**を分離（差が無ければ Lv8 の scale-out の
+焼き直し）、③単一ホスト・800VU の CPU 飽和下では fsync 節約分が CPU 争奪に食われて効果が出ない可能性（Lv3/Lv5 の罠）。
+→ 詳細と実測手順は `docs/learning-log/11-lv11.md`。**load<5 の窓が取れ次第 A/B を回して数値を確定する。**
+
 ---
 
 ## メタな学び

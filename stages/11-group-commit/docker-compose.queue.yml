@@ -1,0 +1,113 @@
+# Lv11 — 並列 committer + group commit（commit_delay）。durability は保ったまま fsync を amortize する。
+#   caddy(:8080) --> api x4 --> redis (Stream) --> consumer(batched, N committers, commit_delay) --> db
+#
+# 狙い: Lv9 で「律速は commit の回数（fsync 固定費）」、Lv10 で「fsync コストは synchronous_commit=off で
+#       削れるが durability を失う。単一 committer では commit_delay は発火しない」と分かった。
+#       Lv11 は durability を保ったまま（synchronous_commit=on のまま）fsync を束ねられるか？を問う。
+#       PostgreSQL の group commit（commit_delay/commit_siblings）は「commit record を書いた瞬間に他に
+#       commit_siblings 本のアクティブ tx がある」ときだけ短い待ちを入れ、その間に揃った複数 commit の
+#       WAL flush を 1回の fsync に束ねる。効かせるには複数 committer が同時に commit へ到達している必要が
+#       あり、Lv9/10 の consumeLoop は 1本ずつ commit する単一 committer だったので発火しなかった。
+#       Lv11 は consumer 内で COMMITTERS 本の committer coroutine を並行させ、別々の pg コネクションで
+#       commit を同時 in-flight にして初めて commit_delay の母集団を作る。
+#
+#       A/B（背中合わせ, 同一 1 consumer・同一負荷）:
+#         baseline = stage09（batched, sync_commit=on, 1 committer, commit_delay=0）
+#         Lv11     = stage11（batched, sync_commit=on, N committers, commit_delay>0）
+#       飽和時の drain throughput / depth / 503 / commit lag を比較する。
+#       ※ commit_delay は synchronous_commit=on のときだけ意味を持つ（off だと fsync を待たない）ので
+#         Lv11 は SYNC_COMMIT_OFF を付けない = Lv10 と違い durability を落とさない。
+#
+# 観測:
+#   depth: curl -s localhost:8080/metrics | grep write_queue_depth
+#   commit lag + batch size: docker compose -f stages/11-group-commit/docker-compose.queue.yml \
+#     exec consumer wget -qO- localhost:3001/metrics | grep write_queue
+#
+# 起動: docker compose -f stages/11-group-commit/docker-compose.queue.yml up --build -d
+# 負荷: docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 -e PEAK_VUS=800 grafana/k6 run - < load/write-heavy.js
+name: pal-lv11-groupcommit
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pal
+      POSTGRES_PASSWORD: pal
+      POSTGRES_DB: pal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # AOF 永続化: コンテナ再起動後も未 ACK エントリを復元できる（教材ポイント）。
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      REDIS_URL: redis://redis:6379
+      ASYNC_WRITE: "1"
+      WRITE_QUEUE_MAX: "100000"
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    expose:
+      - "3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 4
+
+  consumer:
+    build: ../../app
+    # Dockerfile の CMD を上書きして consumer.js を起動。
+    command: ["node", "dist/consumer.js"]
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      REDIS_URL: redis://redis:6379
+      CONSUMER_CONCURRENCY: "10"
+      CONSUMER_PORT: "3001"
+      BATCH_WRITES: "1"
+      WRITE_BATCH_SIZE: "100"
+      # Lv11 の肝: synchronous_commit は on（durability 維持）のまま、
+      #  ① consumer 内に N 本の committer coroutine を回して commit を同時 in-flight にし、
+      #  ② write セッションに commit_delay を設定して group commit の母集団を作る。
+      COMMITTERS: "8"
+      COMMIT_DELAY_US: "200"
+      COMMIT_SIBLINGS: "2"
+    # expose（host バインドしない）で `--scale consumer=2` でもポート衝突しない。
+    #   docker compose -f stages/11-group-commit/docker-compose.queue.yml exec consumer wget -qO- localhost:3001/metrics | grep write_queue
+    expose:
+      - "3001"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

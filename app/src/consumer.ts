@@ -10,7 +10,11 @@
 //   環境変数: DATABASE_URL, REDIS_URL, CONSUMER_CONCURRENCY(default 10),
 //             CONSUMER_PORT(default 3001), INSTANCE_ID,
 //             BATCH_WRITES(default off; "1" でバッチ経路),
-//             WRITE_BATCH_SIZE(default 100; BATCH_WRITES=1 時の XREADGROUP COUNT)
+//             WRITE_BATCH_SIZE(default 100; BATCH_WRITES=1 時の XREADGROUP COUNT),
+//             SYNC_COMMIT_OFF(default off; "1" で write セッションの synchronous_commit=off),
+//             COMMITTERS(default 1; >1 で並列 committer coroutine を N 本回す = Lv11),
+//             COMMIT_DELAY_US(default 0; >0 で write セッションに commit_delay マイクロ秒を設定),
+//             COMMIT_SIBLINGS(default 5; commit_delay を発火させる同時アクティブ tx の下限)
 
 import Fastify from 'fastify';
 import os from 'node:os';
@@ -40,6 +44,28 @@ const WRITE_BATCH_SIZE = Math.max(1, Math.trunc(Number(process.env.WRITE_BATCH_S
 // ※ ロスト範囲は wal_writer_delay（既定 200ms）程度。データ「破損」ではなく最新分の消失。
 const SYNC_COMMIT_OFF = process.env.SYNC_COMMIT_OFF === '1';
 
+// COMMITTERS>1 で並列 committer を N 本回す（Lv11）。既定 1 = Lv9/Lv10 と同一（consumeLoop 1本）。
+// Lv9/10 の consumeLoop は processBatch を await してから次を読むので commit は常に 1本ずつ = 単一
+// committer。commit_delay（group commit）は「commit record を書いた瞬間に他に commit_siblings 本の
+// アクティブ tx がある」ときだけ待ちを入れて fsync を束ねる仕組みなので、単一 committer では原理的に
+// 発火しない（Lv10 の教訓）。N 本の committer が別々の pg コネクションで同時に commit へ到達して初めて
+// group commit が効く。各 coroutine は同一 CONSUMER_NAME で XREADGROUP('>') するが、Redis は 1 entry を
+// group 内の 1 呼び出しにしか配らない（同一 consumer への並行呼び出しでも disjoint）ので重複配送しない。
+// ※ 各 committer には専用の read コネクション（redis.duplicate()）を割り当てる。単一 ioredis コネクション
+//   共有だと 1 本の BLOCK 付き XREADGROUP がコマンドキュー（厳密 FIFO）先頭で最大 1s 居座り、他の committer
+//   の read も INSERT 後の xack すら送信できず直列化して「同時 commit」が崩れるため（QA 指摘）。
+// NaN ガード: 非数値を渡すと Math.max(1, NaN)=NaN → Array.from({length:NaN}) が空配列 → committer が 1 本も
+// 起動せず drain がサイレント停止する。COMMITTERS だけは 0 本起動が致命的なので明示的に 1 へフォールバック。
+const COMMITTERS_RAW = Math.trunc(Number(process.env.COMMITTERS ?? 1));
+const COMMITTERS = Number.isFinite(COMMITTERS_RAW) ? Math.max(1, COMMITTERS_RAW) : 1;
+// COMMIT_DELAY_US>0 で write セッションに commit_delay=<us> を設定（Lv11）。既定 0 = 無効。
+// 注意: commit_delay は synchronous_commit=on のときだけ意味を持つ（off だと backend は fsync を
+// 待たないので束ねる対象が無い）。Lv11 は durability を保ったまま fsync を amortize する実験なので
+// SYNC_COMMIT_OFF は付けずに使う。
+const COMMIT_DELAY_US = Math.max(0, Math.trunc(Number(process.env.COMMIT_DELAY_US ?? 0)));
+// commit_delay を発火させる同時アクティブ tx の下限（PostgreSQL の commit_siblings）。
+const COMMIT_SIBLINGS = Math.max(0, Math.trunc(Number(process.env.COMMIT_SIBLINGS ?? 5)));
+
 // Consumer name must be unique per process so multiple replicas don't clash in the group.
 const CONSUMER_NAME = `consumer-${os.hostname()}-${process.pid}`;
 const STREAM_NAME = 'items:writes';
@@ -54,10 +80,21 @@ const AUTOCLAIM_IDLE_MS = 60000;
 // `options: '-c synchronous_commit=off'` は各物理接続の確立時にサーバへ渡るので、pool.on('connect')
 // で SET を撃つ方式のような「SET 完了前に最初のクエリが走る」レースが原理的に無い。
 // write 経路（この consumer の writePool）だけに効き、read 経路（api 側 readPool）には影響しない。
+// libpq の startup option（`-c key=val`）を接続確立時にサーバへ渡す。pool.on('connect') で SET を
+// 撃つ方式のような「SET 完了前に最初のクエリが走る」レースが原理的に無く、write 経路（この writePool）
+// だけに効く。SYNC_COMMIT_OFF（Lv10）と COMMIT_DELAY_US（Lv11）を 1つの options 文字列に合成する。
+const startupOptions: string[] = [];
+if (SYNC_COMMIT_OFF) startupOptions.push('-c synchronous_commit=off');
+if (COMMIT_DELAY_US > 0) {
+  startupOptions.push(`-c commit_delay=${COMMIT_DELAY_US}`);
+  startupOptions.push(`-c commit_siblings=${COMMIT_SIBLINGS}`);
+}
 const writePool = new Pool({
   connectionString: DATABASE_URL,
-  max: 5,
-  ...(SYNC_COMMIT_OFF ? { options: '-c synchronous_commit=off' } : {}),
+  // 並列 committer が同時に別コネクションで commit へ到達できるよう、COMMITTERS 本 + 予備を張れる
+  // だけの max を確保する（既定 1 のときは従来どおり 5）。
+  max: Math.max(5, COMMITTERS + 1),
+  ...(startupOptions.length > 0 ? { options: startupOptions.join(' ') } : {}),
 });
 
 const redis = new Redis(REDIS_URL, {
@@ -293,14 +330,18 @@ async function processBatch(rawEntries: Array<[string, string[]]>): Promise<void
 type XReadGroupResult = Array<[string, Array<[string, string[]]>]> | null;
 
 // メインポーリングループ。
-async function consumeLoop(): Promise<void> {
+// readConn: この committer 専用の Redis 読み取りコネクション。BLOCK 付き XREADGROUP を撃つので、
+// 他 committer と共有すると FIFO キューで相互ブロックする → committer ごとに分ける。xdel/xack/del など
+// 非ブロッキング系は共有 `redis` のまま（BLOCK しないので相互ブロックしない）。COMMITTERS=1 のときは
+// 呼び出し側が `redis` 自身を渡す（Lv9/Lv10 とコネクション構成もバイト同一に保つ）。
+async function consumeLoop(readConn: Redis): Promise<void> {
   // BATCH_WRITES on のときは WRITE_BATCH_SIZE を COUNT に使う。off は従来どおり CONSUMER_CONCURRENCY。
   const readCount = BATCH_WRITES ? WRITE_BATCH_SIZE : CONSUMER_CONCURRENCY;
 
   while (running) {
     let result: XReadGroupResult;
     try {
-      result = (await redis.xreadgroup(
+      result = (await readConn.xreadgroup(
         'GROUP', GROUP_NAME, CONSUMER_NAME,
         'COUNT', String(readCount),
         'BLOCK', '1000',
@@ -408,6 +449,8 @@ metricsApp.get('/health', async () => ({ status: 'ok', instance: INSTANCE }));
 // 打ち切ると宙吊り（再配送→重複）が最大 batch size 件に増幅する。両ループを await して減らす。
 let loopPromise: Promise<void> | null = null;
 let autoclaimPromise: Promise<void> | null = null;
+// COMMITTERS>1 のときだけ各 committer 専用の read コネクションを張る（1 のときは空＝共有 `redis` を使う）。
+const readConns: Redis[] = [];
 
 async function main(): Promise<void> {
   // lazyConnect: true + enableOfflineQueue: false の組み合わせでは、接続確立前に
@@ -429,7 +472,8 @@ async function main(): Promise<void> {
   console.log(`[consumer] ${CONSUMER_NAME} starting on group=${GROUP_NAME} stream=${STREAM_NAME}`);
   console.log(
     `[consumer] mode: BATCH_WRITES=${BATCH_WRITES} WRITE_BATCH_SIZE=${WRITE_BATCH_SIZE} ` +
-      `synchronous_commit=${SYNC_COMMIT_OFF ? 'off' : 'on'}`,
+      `synchronous_commit=${SYNC_COMMIT_OFF ? 'off' : 'on'} COMMITTERS=${COMMITTERS} ` +
+      `commit_delay=${COMMIT_DELAY_US > 0 ? `${COMMIT_DELAY_US}us(siblings=${COMMIT_SIBLINGS})` : 'off'}`,
   );
 
   // metrics server 起動。
@@ -438,7 +482,41 @@ async function main(): Promise<void> {
 
   // autoclaim と consume を並行起動。autoclaim の Promise も掴んで shutdown で待てるようにする。
   autoclaimPromise = autoclaimLoop().catch((err) => console.error('[consumer] autoclaimLoop error:', err));
-  loopPromise = consumeLoop();
+
+  // COMMITTERS>1 のとき、各 committer 専用の read コネクションを張る（BLOCK の相互ブロック回避）。
+  // COMMITTERS=1 のときは張らず、共有 `redis` をそのまま read に使う（Lv9/Lv10 とコネクション構成一致）。
+  if (COMMITTERS > 1) {
+    for (let i = 0; i < COMMITTERS; i++) {
+      const conn = redis.duplicate();
+      conn.on('error', () => {
+        // Suppress unhandled error events（本体の `redis` と同じ扱い）。
+      });
+      readConns.push(conn);
+    }
+    // lazyConnect: true なので明示 connect。「already connecting/connected」の良性 reject だけ握る。
+    await Promise.all(
+      readConns.map(async (conn) => {
+        try {
+          await conn.connect();
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!/already (connect|connecting|connected)/i.test(msg)) {
+            throw new Error(`[consumer] Redis read-conn connect failed: ${msg}`);
+          }
+        }
+      }),
+    );
+  }
+
+  // COMMITTERS 本の consumeLoop coroutine を並行起動する。各 coroutine は自身の processBatch を
+  // await してから次を読む（＝1本ずつ commit）が、N 本あれば別々の pg コネクションで commit が
+  // 同時に in-flight になり、commit_delay の group commit が効く母集団になる。全 coroutine を
+  // Promise.all で束ねて shutdown（loopPromise の await）で in-flight バッチの完了を待つ。
+  // read コネクション: COMMITTERS=1 は共有 `redis`、>1 は committer 専用 readConns[i]。
+  const loops = Array.from({ length: COMMITTERS }, (_, i) =>
+    consumeLoop(COMMITTERS === 1 ? redis : readConns[i]),
+  );
+  loopPromise = Promise.all(loops).then(() => undefined);
   await loopPromise;
 }
 
@@ -454,7 +532,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
       // （最大 ~1s + 1バッチ）。sleepInterruptible により autoclaim の 10s sleep は即抜ける。
       await Promise.all([loopPromise, autoclaimPromise].filter(Boolean) as Promise<void>[]);
       await metricsApp.close();
-      await Promise.all([writePool.end(), redis.quit()]);
+      await Promise.all([writePool.end(), redis.quit(), ...readConns.map((c) => c.quit())]);
     } finally {
       process.exit(0);
     }
