@@ -1,0 +1,98 @@
+# Lv15 — microservices：items/orders/users を別プロセスに分割 + DB-per-service。
+#   caddy(:8080) --> {items-api, orders-api, users-api}   （path で振り分け）
+#   orders-api --HTTP--> items-api / users-api             （cross-context が網越し）
+#   各 api は自分専用の Postgres を所有（items-db / orders-db / users-db）。
+#
+# 狙い（分解軸の対価）:
+#   - order 作成が auth(→users-api) + 在庫(→items-api) の HTTP hop を踏む → latency 税。
+#   - DB-per-service なので orders は items を JOIN できない。在庫デクリメントは
+#     items-db、order INSERT は orders-db → 別 DB 跨ぎ = 非トランザクション（部分失敗の窓）。
+#   - blast radius: users-api を落とすと /orders は 5xx だが /items は 200 継続（隔離）。
+#   - 独立スケール: `--scale orders-api=3` で orders だけ増やせる。
+#
+# 起動: docker compose -f stages/15-microservices/docker-compose.yml up --build -d
+# 疎通: TOKEN=demo-token-1;
+#   curl -s localhost:8080/items
+#   curl -s -XPOST localhost:8080/orders -H "x-auth-token: $TOKEN" -H 'content-type: application/json' -d '{"itemId":1,"qty":1}'
+#   docker compose -f stages/15-microservices/docker-compose.yml logs orders-api | grep -i http   # 網越し call の証拠
+# blast radius: docker compose -f ... stop users-api  → /items は生存 /orders は 5xx
+# 負荷: docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6 run - < load/orders.js
+name: pal-lv15
+
+x-db-healthcheck: &db-healthcheck
+  test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+
+services:
+  items-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: pal, POSTGRES_PASSWORD: pal, POSTGRES_DB: pal }
+    volumes: [items-pgdata:/var/lib/postgresql/data]
+    healthcheck: *db-healthcheck
+
+  orders-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: pal, POSTGRES_PASSWORD: pal, POSTGRES_DB: pal }
+    volumes: [orders-pgdata:/var/lib/postgresql/data]
+    healthcheck: *db-healthcheck
+
+  users-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: pal, POSTGRES_PASSWORD: pal, POSTGRES_DB: pal }
+    volumes: [users-pgdata:/var/lib/postgresql/data]
+    healthcheck: *db-healthcheck
+
+  items-api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@items-db:5432/pal
+      SERVICE: items
+      SEED_DEMO: "1"          # items-db にデモ item(在庫) を seed（負荷試験の在庫元）。
+      PORT: "3000"
+    expose: ["3000"]
+    depends_on:
+      items-db: { condition: service_healthy }
+
+  users-api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@users-db:5432/pal
+      SERVICE: users
+      SEED_DEMO: "1"          # users-db にデモユーザ(demo-token-1/2) を seed（auth 元）。
+      PORT: "3000"
+    expose: ["3000"]
+    depends_on:
+      users-db: { condition: service_healthy }
+
+  orders-api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@orders-db:5432/pal
+      SERVICE: orders
+      ORDERS_CROSS_CONTEXT: port          # micro は必ず port（網越し）
+      ITEMS_SERVICE_URL: http://items-api:3000
+      USERS_SERVICE_URL: http://users-api:3000
+      PORT: "3000"
+    expose: ["3000"]
+    depends_on:
+      orders-db: { condition: service_healthy }
+      items-api: { condition: service_started }
+      users-api: { condition: service_started }
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - items-api
+      - orders-api
+      - users-api
+
+volumes:
+  items-pgdata:
+  orders-pgdata:
+  users-pgdata:

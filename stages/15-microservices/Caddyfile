@@ -1,0 +1,18 @@
+# API gateway = path でマイクロサービスに振り分ける。ホスト :8080 で受ける。
+# 公開するのは各ドメインの外向き path だけ。/internal/* は晒さない
+# （cross-context の HTTP call は service→service で直接 = gateway を通さない）。
+:80 {
+	handle /items* {
+		reverse_proxy items-api:3000
+	}
+	handle /orders* {
+		reverse_proxy orders-api:3000
+	}
+	handle /users* {
+		reverse_proxy users-api:3000
+	}
+	# 素の疎通確認用に items の health を既定 backend に。
+	handle {
+		reverse_proxy items-api:3000
+	}
+}

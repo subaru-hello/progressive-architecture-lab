@@ -26,3 +26,6 @@
 - [Lv10 — synchronous_commit=off：commit の cost を削る（回数削減には敵わない・durability を払う）](10-lv10.md)
 - [Lv11 — 並列 committer + group commit：durability を保ったまま fsync を束ねる（実装のみ・A/B 実測は延期）](11-lv11.md)
 - [Lv12 — scale-to-zero ↔ always-on：idle コストを cold-start latency に変換する](12-lv12.md)
+- [Lv13 — monolith（多ドメイン app のベースライン）：cross-context を直 SQL JOIN で in-process 解決](13-lv13.md)
+- [Lv14 — modular monolith：env 1 個差で schema 結合を runtime 無料で切る（latency は不変）](14-lv14.md)
+- [Lv15 — microservices：分解の対価を回収（network 税は小・本体は idle 3.3×/原子性喪失/blast-radius 隔離）](15-lv15.md)

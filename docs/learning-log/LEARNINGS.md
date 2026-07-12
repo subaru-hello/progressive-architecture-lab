@@ -3,7 +3,7 @@
 各段の詳細ログ（`NN-*.md`）から、**転用できる教訓だけ**を抜き出して蓄積するファイル。
 段を進めるたびにここへ追記する。各項目に出所の段を `[Lv?]` で付す。
 
-最終更新: 2026-07-11（Lv10 — synchronous_commit=off まで）
+最終更新: 2026-07-12（Lv15 — microservices まで。分解軸 Lv13-15 追記）
 
 ---
 
@@ -226,6 +226,26 @@ interceptor が 0→1 の間リクエストをホールドするので burst で
 workload 数から（＝散発アクセスの休眠 workload が多数あるほど効く。常時トラフィックの単一 workload には
 always-on が正解）。教訓6「数字は控除まで見ろ」の再演。※ Docker-Mac VM は cold-start が実機より膨れる（相対で読む）。
 
+## 33. ⭐ 分解は「in-process の単純さ」を「独立性」と引き換える取引 — 税は latency でなく別の場所に出る `[Lv13][Lv14][Lv15]`
+多ドメイン app(items+orders+users, cross-context=orders→users 認証/orders→items 在庫)を **ポート&アダプタで
+一度だけ書き、アダプタ差し替えだけ**で monolith(直 JOIN)↔modular(in-process ポート)↔micro(HTTP+DB-per-service)を
+背中合わせ。order 作成 latency: med **5.34 → 5.38 → 5.95ms**（monolith ≈ modular < micro）。**monolith→modular は
+差ゼロ**（両方 in-process、port でも関数呼び出し）＝ **schema 結合を切るのは runtime 無料・払うのは設計規律**。
+**modular→micro で初めて税が出る**が、latency 税は **loopback なので小さい（2 hop で +0.6ms）**——実 network なら
+各 hop 1-10ms で 10-100×に膨らむ「下限値」。**本当の対価は latency ではない**（Lv12 と同型: warm 定常は差より他が本体）:
+①**idle 常駐 3.3×**（53→177MiB、プロセス+DB が 3 倍）、②**原子性の喪失**（後述 34）、③見返りは **blast radius 隔離**
+（users-api を落としても /items は 200 継続・monolith は全滅）。**分解の是非は「latency」でなく「独立性がその運用コストに
+見合うか」で決まる**——多チーム並行デプロイ・障害隔離が要る規模で初めて黒字化（Lv12「損益分岐 workload 数」と同型）。
+
+## 34. ⭐ DB-per-service は cross-context JOIN を「網越しの呼び出し」に追放し、原子性を「自前の分散 tx 問題」に変える `[Lv15]`
+monolith は在庫デクリメントと order INSERT を **同一 DB・1 トランザクション**で原子的に処理でき、在庫不足は
+`stock>=qty` ガードで丸ごと ROLLBACK（負在庫も宙吊り order も出ない）——**原子性がタダ**。micro で DB を割ると、
+在庫は items-db・order は orders-db の **別 tx 跨ぎ**になり、「在庫を引いた後に order INSERT が失敗すると在庫だけ減って
+order が消える」恒久リークの窓が開く。**Lv13 でタダだった原子性が、分解した瞬間に saga/outbox/冪等リトライを
+自分で書く分散トランザクション問題に化ける**。cross-context の呼び出し自体も HTTP アダプタが `AbortSignal.timeout` +
+非 2xx throw で**失敗を正直に 5xx へ伝える**のが肝（silent success にすると blast radius が嘘になる＝Lv2 の
+「502 高速返しで throughput が嘘をつく」の裏返し）。
+
 ---
 
 ## メタな学び
@@ -237,3 +257,6 @@ always-on が正解）。教訓6「数字は控除まで見ろ」の再演。※
 > ただし計測はエラー率まで見ないと騙され、k8s では probe が飽和時に牙をむく。
 > そして DB write は「行数」でなく「commit 回数」で詰まる——バッチ化は速さと引き換えに障害の粒度を粗くする。
 > 同じ fsync 壁でも「回数を削る」が「コストを削る」を圧倒し、どのレバーも効くのは壁がまだそこにある時だけ。
+> scale-to-zero も分解も throughput は増やさない取引だ——前者は idle コストを cold-start latency に、
+> 後者は in-process の単純さ（原子性・低 latency）を独立性（デプロイ/障害隔離/スケール）に変える。
+> どちらも本当の対価は latency でなく「常駐コスト・分散データの痛み・損益分岐」に出る。
