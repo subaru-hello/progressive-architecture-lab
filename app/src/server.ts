@@ -12,6 +12,8 @@ import { PgUsersRepo } from './domains/users/infra/pg-users-repo.js';
 import { PgOrdersRepo } from './domains/orders/infra/pg-orders-repo.js';
 import { InProcessItemsAdapter, HttpItemsAdapter, DualWriteItemsAdapter, MIGRATION_MODES } from './ports/items-port.js';
 import type { MigrationMode } from './ports/items-port.js';
+import { TX_MODES } from './domains/orders/usecase/create-order.js';
+import type { TxMode } from './domains/orders/usecase/create-order.js';
 import { InProcessUsersAdapter, HttpUsersAdapter } from './ports/users-port.js';
 import { mudRoutes } from './mud/routes.js';
 import { mudInitSchema, mudSeed } from './mud/schema.js';
@@ -48,6 +50,20 @@ if (!MIGRATION_MODES.includes(ITEMS_MIGRATION_MODE)) {
     `ITEMS_MIGRATION_MODE must be one of ${MIGRATION_MODES.join(', ')}, got: '${ITEMS_MIGRATION_MODE}'`,
   );
 }
+
+// Lv19: 分散トランザクション戦略。ITEMS_SERVICE_URL がないと 2pc/saga は設定ミス。
+// Lv19: distributed-tx strategy. 2pc/saga require ITEMS_SERVICE_URL — fail fast if missing.
+const ORDER_TX_MODE = (process.env.ORDER_TX_MODE ?? 'none') as TxMode;
+if (!TX_MODES.includes(ORDER_TX_MODE)) {
+  throw new Error(`ORDER_TX_MODE must be one of ${TX_MODES.join(', ')}, got: '${ORDER_TX_MODE}'`);
+}
+if ((ORDER_TX_MODE === '2pc' || ORDER_TX_MODE === 'saga') && !ITEMS_SERVICE_URL) {
+  throw new Error(`ORDER_TX_MODE=${ORDER_TX_MODE} requires ITEMS_SERVICE_URL to be set`);
+}
+
+// Lv19 フォルトインジェクション。
+// Lv19 fault injection: '' = off; 'after-first-write' | 'after-prepare-all' = inject fault.
+const FAULT_POINT = process.env.FAULT_POINT ?? '';
 
 // mud モードに外部サービス URL を組み合わせると「seam がない」という教訓が崩れる。
 // Combining mud with external service URLs defeats the "no seam" lesson — fail fast.
@@ -187,6 +203,10 @@ const dualWriteSecondaryError = new client.Counter({
 // オブジェクト経由で渡すことで itemsRoutes プラグインが参照を共有できる。
 // Passed as object so itemsRoutes plugin shares the same reference.
 const cacheCounters = { hits: 0, misses: 0 };
+
+// Lv19 saga 回復ポーラー: saga モードかつ orders ロード時のみ起動。
+// Lv19 saga recovery poller: started only in saga mode when orders are loaded.
+let sagaPoller: ReturnType<typeof setInterval> | null = null;
 
 const app = Fastify({ logger: true });
 
@@ -351,6 +371,10 @@ if (ARCH === 'mud') {
       itemsPort,
       mode: ORDERS_CROSS_CONTEXT,
       INSTANCE,
+      // Lv19: port モードのみ有効。join モードでは txMode は無視。
+      // Lv19: txMode only meaningful in port mode; ignored for join mode.
+      txMode: ORDERS_CROSS_CONTEXT === 'port' ? ORDER_TX_MODE : 'none',
+      fault: { faultPoint: FAULT_POINT },
     });
 
     // Lv18 管理エンドポイント: ランタイムで移行モードを切り替える（コンテナ再起動不要）。
@@ -372,6 +396,44 @@ if (ARCH === 'mud') {
         adapter.setMode(body.mode as MigrationMode);
         return { mode: adapter.getMode() };
       });
+    }
+
+    // Lv19 saga 回復ポーラー: saga モード + orders ロード + ITEMS_SERVICE_URL がある場合に起動。
+    // Lv19 saga recovery poller: start only when saga mode is active, orders are loaded, and
+    // ITEMS_SERVICE_URL is set (so items-service release can be called).
+    if (ORDER_TX_MODE === 'saga' && ITEMS_SERVICE_URL) {
+      // itemsPort の型を narrowing して releaseStock を呼べるようにする。
+      // Capture itemsPort in closure for poller; it satisfies ItemsPort (has releaseStock).
+      const pollerItemsPort = itemsPort;
+      const pollerOrdersRepo = ordersRepo;
+      // スタック閾値: 3 秒以上 'reserved' のままの saga_log を「スタック」とみなす。
+      // Threshold: saga_log rows stuck in 'reserved' for > 3s are considered orphaned.
+      const STUCK_THRESHOLD_SECONDS = 3;
+
+      sagaPoller = setInterval(async () => {
+        try {
+          // アトミックに 'compensating' に遷移させてから補償 — re-entrant safe。
+          // Atomically transition to 'compensating' before compensating — re-entrant safe.
+          const stuck = await pollerOrdersRepo.claimStuckSagaLogs(STUCK_THRESHOLD_SECONDS);
+          for (const row of stuck) {
+            try {
+              // release は冪等 — 既に release 済みでも安全。
+              // release is idempotent — safe to call even if already released.
+              await pollerItemsPort.releaseStock(row.gid);
+              await pollerOrdersRepo.updateSagaLogState(row.gid, 'compensated');
+            } catch (err) {
+              // 補償失敗は次回ポーリングで再試行 — state='compensating' のままで再 claim されない。
+              // Compensation failure will be retried next interval — state stays 'compensating'
+              // so claimStuckSagaLogs won't pick it up again (it only claims 'reserved' rows).
+              app.log.warn({ gid: row.gid, err }, 'saga poller: compensation failed, will not retry (state=compensating)');
+            }
+          }
+        } catch (err) {
+          // DB 障害など — 次回ポーリングで再試行。
+          // DB error — retry next interval.
+          app.log.warn({ err }, 'saga poller: error querying stuck sagas');
+        }
+      }, 2000);
     }
   }
 }
@@ -408,6 +470,21 @@ async function initDb(): Promise<void> {
   if (loadOrders) {
     const repo = new PgOrdersRepo(writePool);
     await repo.initSchema();
+    // Lv19 saga: saga_log は orders ドメインが所有するテーブル。
+    // ORDER_TX_MODE に関係なく orders がロードされれば作成 — コーディネーターのモード設定と分離。
+    // Lv19 saga: saga_log is owned by the orders domain.
+    // Create whenever orders is loaded, regardless of ORDER_TX_MODE — decouple from coordinator config.
+    await repo.initSagaSchema();
+  }
+  if (loadItems) {
+    // Lv19 saga: reservations は items ドメインが所有するテーブル。
+    // items-service (SERVICE=items) は ORDER_TX_MODE を持たないが、
+    // saga プロトコルの参加者として reservations を準備しておく必要がある。
+    // Lv19 saga: reservations is owned by the items domain.
+    // items-service (SERVICE=items) has no ORDER_TX_MODE; it must still provision reservations
+    // so it is a ready protocol participant when the coordinator calls /internal/reserve.
+    const repo = new PgItemsRepo(writePool, readPool);
+    await repo.initSagaSchema();
   }
 }
 
@@ -471,6 +548,9 @@ async function main(): Promise<void> {
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, async () => {
     app.log.info(`${sig} received, shutting down...`);
+    // Lv19 saga ポーラーを停止。
+    // Lv19: stop the saga recovery poller before closing connections.
+    if (sagaPoller !== null) clearInterval(sagaPoller);
     try {
       await app.close();
       await Promise.all([writePool.end(), readPool.end(), ...(redis ? [redis.quit()] : []), ...(pool ? [pool.destroy()] : [])]);

@@ -157,6 +157,82 @@ export async function itemsRoutes(app: FastifyInstance, opts: ItemsPluginOptions
     return { ok: true, stock: result.stock };
   });
 
+  // Lv19 2PC: items-db 側の prepare-decrement。
+  // Lv19 2PC: prepare a decrement in items-db (phase-1 of 2PC).
+  app.post('/internal/tx/prepare-decrement', async (req, reply) => {
+    const body = req.body as { gid?: string; itemId?: number; qty?: number };
+    if (!body?.gid || body.itemId == null || body.qty == null || body.qty <= 0) {
+      reply.code(400);
+      return { error: 'gid, itemId, and positive qty are required' };
+    }
+    const result = await itemsRepo.prepareDecrement(body.gid, Number(body.itemId), Number(body.qty));
+    if (!result.ok) {
+      reply.code(409);
+      return { error: 'insufficient stock', stock: result.stock };
+    }
+    return { ok: true, stock: result.stock };
+  });
+
+  // Lv19 2PC: commit a prepared transaction in items-db.
+  app.post('/internal/tx/:gid/commit', async (req, reply) => {
+    const { gid } = req.params as { gid: string };
+    try {
+      await itemsRepo.commitPrepared(gid);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      reply.code(500);
+      return { error: `commit prepared failed: ${msg}` };
+    }
+    return { ok: true };
+  });
+
+  // Lv19 2PC: rollback a prepared transaction in items-db.
+  app.post('/internal/tx/:gid/rollback', async (req, reply) => {
+    const { gid } = req.params as { gid: string };
+    try {
+      await itemsRepo.rollbackPrepared(gid);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      reply.code(500);
+      return { error: `rollback prepared failed: ${msg}` };
+    }
+    return { ok: true };
+  });
+
+  // Lv19 saga: 冪等 reserve。
+  // Lv19 saga: idempotent stock reservation.
+  app.post('/internal/reserve', async (req, reply) => {
+    const body = req.body as { gid?: string; itemId?: number; qty?: number };
+    if (!body?.gid || body.itemId == null || body.qty == null || body.qty <= 0) {
+      reply.code(400);
+      return { error: 'gid, itemId, and positive qty are required' };
+    }
+    const result = await itemsRepo.reserve(body.gid, Number(body.itemId), Number(body.qty));
+    if (!result.ok) {
+      reply.code(409);
+      return { error: 'insufficient stock', stock: result.stock };
+    }
+    return { ok: true, stock: result.stock };
+  });
+
+  // Lv19 saga: 冪等 release (補償)。
+  // Lv19 saga: idempotent release (compensation).
+  app.post('/internal/release', async (req, reply) => {
+    const body = req.body as { gid?: string };
+    if (!body?.gid) {
+      reply.code(400);
+      return { error: 'gid is required' };
+    }
+    try {
+      await itemsRepo.release(body.gid);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      reply.code(500);
+      return { error: `release failed: ${msg}` };
+    }
+    return { ok: true };
+  });
+
   // Lv18 バックフィル用: 全 item 取得（LIMIT なし）。ストラングラーフィグ移行時のソース DB 読み取り。
   // Lv18 backfill: fetch ALL items (no LIMIT) — read source-of-truth during strangler-fig migration.
   app.get('/internal/items/all', async () => {

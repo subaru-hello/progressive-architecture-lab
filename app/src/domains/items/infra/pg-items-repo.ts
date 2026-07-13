@@ -138,4 +138,152 @@ export class PgItemsRepo implements ItemsRepoPort {
     if (rows.length === 0) return { ok: false, stock: 0 };
     return { ok: true, stock: rows[0].stock };
   }
+
+  // Lv19 2PC: BEGIN → UPDATE → PREPARE TRANSACTION '<gid>' の順で実行。
+  // クライアントを PREPARE 後に release — prepared tx は pool 外で生き続ける。
+  // Lv19 2PC: BEGIN → UPDATE → PREPARE TRANSACTION '<gid>'; release client after PREPARE.
+  // The prepared tx is dissociated from the connection and persists in items-db.
+  async prepareDecrement(gid: string, id: number, qty: number): Promise<{ ok: boolean; stock: number }> {
+    const c = await this.writePool.connect();
+    try {
+      await c.query('BEGIN');
+      const { rows } = await c.query(
+        'UPDATE items SET stock = stock - $2 WHERE id = $1 AND stock >= $2 RETURNING stock',
+        [id, qty],
+      );
+      if (rows.length === 0) {
+        await c.query('ROLLBACK');
+        return { ok: false, stock: 0 };
+      }
+      // gid をシングルクォートエスケープして安全に埋め込む (gid は crypto.randomUUID() 由来)。
+      // Escape gid single-quotes before embedding — gid comes from crypto.randomUUID() so
+      // no injection risk, but defensive programming is warranted for prepared-tx names.
+      await c.query(`PREPARE TRANSACTION '${gid.replace(/'/g, "''")}'`);
+      return { ok: true, stock: rows[0].stock };
+    } catch (err) {
+      try { await c.query('ROLLBACK'); } catch { /* ignore cleanup error */ }
+      throw err;
+    } finally {
+      // PREPARE 後は tx が切り離されるのでクライアントを解放しても tx は保持される。
+      // After PREPARE the tx is dissociated — releasing the client does NOT lose the tx.
+      c.release();
+    }
+  }
+
+  // Lv19 2PC: COMMIT PREPARED — 任意のプール接続で実行できる。
+  // "prepared transaction not found" は既に解決済みとして扱い、静かに無視する (冪等)。
+  // Lv19 2PC: COMMIT PREPARED on any pooled connection. Idempotent — ignore "not found".
+  async commitPrepared(gid: string): Promise<void> {
+    try {
+      await this.writePool.query(`COMMIT PREPARED '${gid.replace(/'/g, "''")}'`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/prepared transaction with identifier.*does not exist/i.test(msg)) return; // already resolved
+      throw err;
+    }
+  }
+
+  // Lv19 2PC: ROLLBACK PREPARED — 冪等。
+  // Lv19 2PC: ROLLBACK PREPARED — idempotent.
+  async rollbackPrepared(gid: string): Promise<void> {
+    try {
+      await this.writePool.query(`ROLLBACK PREPARED '${gid.replace(/'/g, "''")}'`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/prepared transaction with identifier.*does not exist/i.test(msg)) return; // already resolved
+      throw err;
+    }
+  }
+
+  // Lv19 saga: reservations テーブルを利用した冪等 reserve。
+  // gid が既に reservations に存在 → 以前の結果を返す (idempotent replay)。
+  // なければ stock -= qty を試み、成功なら reservations に INSERT。
+  // Lv19 saga: idempotent reserve using reservations table.
+  async reserve(gid: string, id: number, qty: number): Promise<{ ok: boolean; stock: number }> {
+    const c = await this.writePool.connect();
+    try {
+      await c.query('BEGIN');
+      // 冪等チェック: gid が既に存在すれば以前の結果を返す。
+      // Idempotency check: if gid already exists return the prior outcome.
+      const existing = await c.query(
+        'SELECT qty, released FROM reservations WHERE gid = $1',
+        [gid],
+      );
+      if (existing.rows.length > 0) {
+        await c.query('COMMIT');
+        // released は補償済みを意味するが reserve として ok:true で返す (saga が判断)。
+        // released means compensated but we return ok:true — the saga coordinator decides.
+        const { rows: stockRows } = await c.query(
+          'SELECT stock FROM items WHERE id = $1', [id],
+        );
+        return { ok: true, stock: stockRows[0]?.stock ?? 0 };
+      }
+      const { rows } = await c.query(
+        'UPDATE items SET stock = stock - $2 WHERE id = $1 AND stock >= $2 RETURNING stock',
+        [id, qty],
+      );
+      if (rows.length === 0) {
+        await c.query('ROLLBACK');
+        return { ok: false, stock: 0 };
+      }
+      await c.query(
+        'INSERT INTO reservations(gid, item_id, qty) VALUES($1, $2, $3)',
+        [gid, id, qty],
+      );
+      await c.query('COMMIT');
+      return { ok: true, stock: rows[0].stock };
+    } catch (err) {
+      try { await c.query('ROLLBACK'); } catch { /* ignore */ }
+      throw err;
+    } finally {
+      c.release();
+    }
+  }
+
+  // Lv19 saga: stock を戻し released=true にマーク。冪等 (released 済みなら何もしない)。
+  // Lv19 saga: return stock and mark released. Idempotent — no-op if already released.
+  async release(gid: string): Promise<void> {
+    const c = await this.writePool.connect();
+    try {
+      await c.query('BEGIN');
+      const { rows } = await c.query(
+        'SELECT item_id, qty, released FROM reservations WHERE gid = $1 FOR UPDATE',
+        [gid],
+      );
+      if (rows.length === 0 || rows[0].released) {
+        // 既に補償済み、または存在しない → 冪等として成功扱い。
+        // Already released or no reservation found — idempotent no-op.
+        await c.query('COMMIT');
+        return;
+      }
+      await c.query(
+        'UPDATE items SET stock = stock + $2 WHERE id = $1',
+        [rows[0].item_id, rows[0].qty],
+      );
+      await c.query(
+        'UPDATE reservations SET released = true WHERE gid = $1',
+        [gid],
+      );
+      await c.query('COMMIT');
+    } catch (err) {
+      try { await c.query('ROLLBACK'); } catch { /* ignore */ }
+      throw err;
+    } finally {
+      c.release();
+    }
+  }
+
+  // Lv19 saga: reservations テーブルを作成 (saga モードがアクティブな場合のみ呼ばれる)。
+  // Lv19 saga: create the reservations table (called only when saga mode is active).
+  async initSagaSchema(): Promise<void> {
+    await this.writePool.query(`
+      CREATE TABLE IF NOT EXISTS reservations (
+        gid TEXT PRIMARY KEY,
+        item_id INT NOT NULL,
+        qty INT NOT NULL,
+        released BOOL NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+  }
 }

@@ -4,7 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import type { UsersPort } from '../../ports/users-port.js';
 import type { ItemsPort } from '../../ports/items-port.js';
 import type { OrdersRepoPort } from './ports.js';
-import { createOrder, AuthError, StockError } from './usecase/create-order.js';
+import { createOrder, AuthError, StockError, type TxMode, type FaultOpts } from './usecase/create-order.js';
 import { listOrders } from './usecase/list-orders.js';
 
 export interface OrdersPluginOptions {
@@ -13,10 +13,14 @@ export interface OrdersPluginOptions {
   itemsPort: ItemsPort;
   mode: 'join' | 'port';
   INSTANCE: string;
+  // Lv19: port モードのみ有効。未設定時は 'none' = 既存動作。
+  // Lv19: only active in port mode; defaults to 'none' = existing behavior.
+  txMode?: TxMode;
+  fault?: FaultOpts;
 }
 
 export async function ordersRoutes(app: FastifyInstance, opts: OrdersPluginOptions): Promise<void> {
-  const { ordersRepo, usersPort, itemsPort, mode, INSTANCE } = opts;
+  const { ordersRepo, usersPort, itemsPort, mode, INSTANCE, txMode = 'none', fault } = opts;
 
   app.post('/orders', async (req, reply) => {
     const token = req.headers['x-auth-token'] as string | undefined;
@@ -35,7 +39,10 @@ export async function ordersRoutes(app: FastifyInstance, opts: OrdersPluginOptio
     }
 
     try {
-      const order = await createOrder({ token, itemId, qty }, { usersPort, itemsPort, ordersRepo, mode });
+      const order = await createOrder(
+        { token, itemId, qty },
+        { usersPort, itemsPort, ordersRepo, mode, txMode, fault },
+      );
       reply.code(201);
       return { instance: INSTANCE, order };
     } catch (err) {

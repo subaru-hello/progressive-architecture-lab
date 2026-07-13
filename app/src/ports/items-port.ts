@@ -8,6 +8,17 @@ export type { Item };
 export interface ItemsPort {
   getItem(id: number): Promise<Item | null>;
   decrementStock(id: number, qty: number): Promise<{ ok: boolean; stock: number }>;
+
+  // Lv19 2PC: items-service の prepare/commit/rollback。
+  // Lv19 2PC: items-service side prepare/commit/rollback (HTTP calls to /internal/tx/*).
+  prepareTxDecrement(gid: string, itemId: number, qty: number): Promise<{ ok: boolean; stock: number }>;
+  commitTx(gid: string): Promise<void>;
+  rollbackTx(gid: string): Promise<void>;
+
+  // Lv19 saga: 冪等 reserve / release。
+  // Lv19 saga: idempotent reserve / release (HTTP calls to /internal/reserve|release).
+  reserveStock(gid: string, itemId: number, qty: number): Promise<{ ok: boolean; stock: number }>;
+  releaseStock(gid: string): Promise<void>;
 }
 
 // インプロセスアダプタ: 同一プロセス内の items リポジトリを直接呼ぶ。
@@ -21,6 +32,30 @@ export class InProcessItemsAdapter implements ItemsPort {
 
   decrementStock(id: number, qty: number): Promise<{ ok: boolean; stock: number }> {
     return this.itemsRepo.decrementStock(id, qty);
+  }
+
+  // Lv19 2PC: インプロセスはリポジトリに直接委譲。
+  // Lv19 2PC: in-process delegates directly to the repo.
+  prepareTxDecrement(gid: string, itemId: number, qty: number): Promise<{ ok: boolean; stock: number }> {
+    return this.itemsRepo.prepareDecrement(gid, itemId, qty);
+  }
+
+  commitTx(gid: string): Promise<void> {
+    return this.itemsRepo.commitPrepared(gid);
+  }
+
+  rollbackTx(gid: string): Promise<void> {
+    return this.itemsRepo.rollbackPrepared(gid);
+  }
+
+  // Lv19 saga: インプロセスはリポジトリに直接委譲。
+  // Lv19 saga: in-process delegates directly to the repo.
+  reserveStock(gid: string, itemId: number, qty: number): Promise<{ ok: boolean; stock: number }> {
+    return this.itemsRepo.reserve(gid, itemId, qty);
+  }
+
+  releaseStock(gid: string): Promise<void> {
+    return this.itemsRepo.release(gid);
   }
 }
 
@@ -98,6 +133,40 @@ export class DualWriteItemsAdapter implements ItemsPort {
     return primaryResult;
   }
 
+  // Lv19 2PC/saga: DualWriteAdapter はモードに応じてプライマリかセカンダリに委譲。
+  // Lv19 2PC/saga: DualWriteAdapter delegates to primary or secondary based on mode.
+  // secondary_only → secondary; others → primary (2pc/saga は移行後の secondary_only 想定)。
+  // In practice these are called only after migration is complete (secondary_only mode).
+  prepareTxDecrement(gid: string, itemId: number, qty: number): Promise<{ ok: boolean; stock: number }> {
+    return this.mode === 'secondary_only'
+      ? this.secondary.prepareTxDecrement(gid, itemId, qty)
+      : this.primary.prepareTxDecrement(gid, itemId, qty);
+  }
+
+  commitTx(gid: string): Promise<void> {
+    return this.mode === 'secondary_only'
+      ? this.secondary.commitTx(gid)
+      : this.primary.commitTx(gid);
+  }
+
+  rollbackTx(gid: string): Promise<void> {
+    return this.mode === 'secondary_only'
+      ? this.secondary.rollbackTx(gid)
+      : this.primary.rollbackTx(gid);
+  }
+
+  reserveStock(gid: string, itemId: number, qty: number): Promise<{ ok: boolean; stock: number }> {
+    return this.mode === 'secondary_only'
+      ? this.secondary.reserveStock(gid, itemId, qty)
+      : this.primary.reserveStock(gid, itemId, qty);
+  }
+
+  releaseStock(gid: string): Promise<void> {
+    return this.mode === 'secondary_only'
+      ? this.secondary.releaseStock(gid)
+      : this.primary.releaseStock(gid);
+  }
+
   async decrementStock(id: number, qty: number): Promise<{ ok: boolean; stock: number }> {
     // モードを呼び出し開始時に一度だけ読む — await 後の setMode 呼び出しで分岐が変わらないよう。
     // Snapshot mode once at call entry so a concurrent setMode cannot tear this call's behavior.
@@ -161,5 +230,79 @@ export class HttpItemsAdapter implements ItemsPort {
     if (!res.ok) throw new Error(`items service decrementStock failed: ${res.status}`);
     const data = await res.json() as { ok: boolean; stock: number };
     return { ok: data.ok, stock: data.stock };
+  }
+
+  // Lv19 2PC: items-service の /internal/tx/prepare-decrement を呼ぶ。
+  // Lv19 2PC: call items-service /internal/tx/prepare-decrement.
+  async prepareTxDecrement(gid: string, itemId: number, qty: number): Promise<{ ok: boolean; stock: number }> {
+    const res = await fetch(`${this.baseUrl}/internal/tx/prepare-decrement`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gid, itemId, qty }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.status === 409) {
+      const data = await res.json() as { stock: number };
+      return { ok: false, stock: data.stock ?? 0 };
+    }
+    if (!res.ok) throw new Error(`items service prepareTxDecrement failed: ${res.status}`);
+    const data = await res.json() as { ok: boolean; stock: number };
+    return { ok: data.ok, stock: data.stock };
+  }
+
+  // Lv19 2PC: items-service の /internal/tx/:gid/commit を呼ぶ。
+  // Lv19 2PC: call items-service /internal/tx/:gid/commit.
+  async commitTx(gid: string): Promise<void> {
+    // gid は path に載る。body は無いので Content-Type は付けない
+    // (application/json + 空 body は Fastify が 400 で弾く)。
+    // gid travels in the path; send NO body and NO content-type
+    // (empty body + application/json makes Fastify reject with 400).
+    const res = await fetch(`${this.baseUrl}/internal/tx/${encodeURIComponent(gid)}/commit`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error(`items service commitTx failed: ${res.status}`);
+  }
+
+  // Lv19 2PC: items-service の /internal/tx/:gid/rollback を呼ぶ。
+  // Lv19 2PC: call items-service /internal/tx/:gid/rollback.
+  async rollbackTx(gid: string): Promise<void> {
+    // body 無し → Content-Type を付けない (Fastify の空 body 400 回避)。
+    // No body → omit Content-Type (avoids Fastify's empty-body 400).
+    const res = await fetch(`${this.baseUrl}/internal/tx/${encodeURIComponent(gid)}/rollback`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error(`items service rollbackTx failed: ${res.status}`);
+  }
+
+  // Lv19 saga: items-service の /internal/reserve を呼ぶ。
+  // Lv19 saga: call items-service /internal/reserve.
+  async reserveStock(gid: string, itemId: number, qty: number): Promise<{ ok: boolean; stock: number }> {
+    const res = await fetch(`${this.baseUrl}/internal/reserve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gid, itemId, qty }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.status === 409) {
+      const data = await res.json() as { stock: number };
+      return { ok: false, stock: data.stock ?? 0 };
+    }
+    if (!res.ok) throw new Error(`items service reserveStock failed: ${res.status}`);
+    const data = await res.json() as { ok: boolean; stock: number };
+    return { ok: data.ok, stock: data.stock };
+  }
+
+  // Lv19 saga: items-service の /internal/release を呼ぶ。
+  // Lv19 saga: call items-service /internal/release.
+  async releaseStock(gid: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/internal/release`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gid }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error(`items service releaseStock failed: ${res.status}`);
   }
 }
