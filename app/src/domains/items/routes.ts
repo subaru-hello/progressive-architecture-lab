@@ -1,8 +1,11 @@
+// items HTTP アダプタ: リクエスト解析 → ユースケース呼び出し → レスポンスマッピング。
+// Items HTTP adapter: parse request → call usecase → map response. No SQL here.
+// Lv6-8 機構（cache-aside Redis + ASYNC_WRITE Redis Stream）はインフラ関心事としてここに保持。
+// Lv6-8 machinery (cache-aside Redis + ASYNC_WRITE Redis Stream) kept here as infra concern.
 import type { FastifyInstance } from 'fastify';
-import type { Pool } from 'pg';
 import type { Redis } from 'ioredis';
 import type { Counter } from 'prom-client';
-import { listLatest100, getById, create, decrementStock } from './repo.js';
+import type { ItemsRepoPort } from './ports.js';
 
 // items ドメインが使う定数。server.ts から移植。
 // Constants migrated from server.ts — single source of truth for items cache.
@@ -11,8 +14,7 @@ export const CACHE_TTL = 30; // seconds
 export const STREAM_NAME = 'items:writes';
 
 export interface ItemsPluginOptions {
-  writePool: Pool;
-  readPool: Pool;
+  itemsRepo: ItemsRepoPort;
   redis: Redis | null;
   INSTANCE: string;
   ASYNC_WRITE: string | undefined;
@@ -24,7 +26,7 @@ export interface ItemsPluginOptions {
 }
 
 export async function itemsRoutes(app: FastifyInstance, opts: ItemsPluginOptions): Promise<void> {
-  const { writePool, readPool, redis, INSTANCE, ASYNC_WRITE, WRITE_QUEUE_MAX, cacheHits, cacheMisses, cacheCounters } = opts;
+  const { itemsRepo, redis, INSTANCE, ASYNC_WRITE, WRITE_QUEUE_MAX, cacheHits, cacheMisses, cacheCounters } = opts;
 
   app.get('/items', async () => {
     // Cache-aside: Redis があれば先に試す。
@@ -45,7 +47,7 @@ export async function itemsRoutes(app: FastifyInstance, opts: ItemsPluginOptions
       cacheCounters.misses++;
     }
 
-    const rows = await listLatest100(readPool);
+    const rows = await itemsRepo.listLatest100();
 
     if (redis) {
       try {
@@ -91,7 +93,7 @@ export async function itemsRoutes(app: FastifyInstance, opts: ItemsPluginOptions
 
     // 同期パス (Lv0-7 互換): INSERT + 201 + cache DEL。
     // Synchronous path (Lv0-7 compat): INSERT + 201 + cache DEL.
-    const item = await create(writePool, body.name);
+    const item = await itemsRepo.create(body.name);
 
     if (redis) {
       try {
@@ -116,11 +118,11 @@ export async function itemsRoutes(app: FastifyInstance, opts: ItemsPluginOptions
     };
   });
 
-  // 個別 item 取得（新規追加）。
-  // Fetch single item by id (new endpoint).
+  // 個別 item 取得。
+  // Fetch single item by id.
   app.get('/items/:id', async (req, reply) => {
     const { id } = req.params as { id: string };
-    const item = await getById(readPool, Number(id));
+    const item = await itemsRepo.getById(Number(id));
     if (!item) {
       reply.code(404);
       return { error: 'not found' };
@@ -132,7 +134,7 @@ export async function itemsRoutes(app: FastifyInstance, opts: ItemsPluginOptions
   // Internal endpoint: for HTTP adapter (orders → items).
   app.get('/internal/items/:id', async (req, reply) => {
     const { id } = req.params as { id: string };
-    const item = await getById(readPool, Number(id));
+    const item = await itemsRepo.getById(Number(id));
     if (!item) {
       reply.code(404);
       return { error: 'not found' };
@@ -147,7 +149,7 @@ export async function itemsRoutes(app: FastifyInstance, opts: ItemsPluginOptions
       reply.code(400);
       return { error: 'qty must be a positive number' };
     }
-    const result = await decrementStock(writePool, Number(id), body.qty);
+    const result = await itemsRepo.decrementStock(Number(id), body.qty);
     if (!result.ok) {
       reply.code(409);
       return { error: 'insufficient stock', stock: result.stock };

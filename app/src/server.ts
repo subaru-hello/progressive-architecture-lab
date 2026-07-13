@@ -7,9 +7,9 @@ import { WorkerPool } from './pool.js';
 import { itemsRoutes, STREAM_NAME } from './domains/items/routes.js';
 import { usersRoutes } from './domains/users/routes.js';
 import { ordersRoutes } from './domains/orders/routes.js';
-import { initSchema as itemsInitSchema, seed as itemsSeed } from './domains/items/repo.js';
-import { initSchema as usersInitSchema, seed as usersSeed } from './domains/users/repo.js';
-import { initSchema as ordersInitSchema } from './domains/orders/repo.js';
+import { PgItemsRepo } from './domains/items/infra/pg-items-repo.js';
+import { PgUsersRepo } from './domains/users/infra/pg-users-repo.js';
+import { PgOrdersRepo } from './domains/orders/infra/pg-orders-repo.js';
 import { InProcessItemsAdapter, HttpItemsAdapter } from './ports/items-port.js';
 import { InProcessUsersAdapter, HttpUsersAdapter } from './ports/users-port.js';
 import { mudRoutes } from './mud/routes.js';
@@ -262,10 +262,14 @@ if (ARCH === 'mud') {
   const loadUsers = SERVICE === 'all' || SERVICE === 'users';
   const loadOrders = SERVICE === 'all' || SERVICE === 'orders';
 
+  // コンポジションルート: pg リポジトリをインスタンス化し、ルートに注入する。
+  // Composition root: instantiate pg repos and inject into routes.
+  const itemsRepo = new PgItemsRepo(writePool, readPool);
+  const usersRepo = new PgUsersRepo(writePool);
+
   if (loadItems) {
     await app.register(itemsRoutes, {
-      writePool,
-      readPool,
+      itemsRepo,
       redis,
       INSTANCE,
       ASYNC_WRITE,
@@ -277,24 +281,26 @@ if (ARCH === 'mud') {
   }
 
   if (loadUsers) {
-    await app.register(usersRoutes, { writePool, INSTANCE });
+    await app.register(usersRoutes, { usersRepo, INSTANCE });
   }
 
   if (loadOrders) {
+    const ordersRepo = new PgOrdersRepo(writePool);
+
     // items ポートの選択: ITEMS_SERVICE_URL が設定されていれば HTTP アダプタ、なければインプロセス。
     // Items port selection: HTTP adapter when ITEMS_SERVICE_URL is set, in-process otherwise.
     const itemsPort = ITEMS_SERVICE_URL
       ? new HttpItemsAdapter(ITEMS_SERVICE_URL)
-      : new InProcessItemsAdapter(writePool);
+      : new InProcessItemsAdapter(itemsRepo);
 
     // users ポートの選択: USERS_SERVICE_URL が設定されていれば HTTP アダプタ、なければインプロセス。
     // Users port selection: HTTP adapter when USERS_SERVICE_URL is set, in-process otherwise.
     const usersPort = USERS_SERVICE_URL
       ? new HttpUsersAdapter(USERS_SERVICE_URL)
-      : new InProcessUsersAdapter(writePool);
+      : new InProcessUsersAdapter(usersRepo);
 
     await app.register(ordersRoutes, {
-      ordersPool: writePool,
+      ordersRepo,
       usersPort,
       itemsPort,
       mode: ORDERS_CROSS_CONTEXT,
@@ -321,16 +327,21 @@ async function initDb(): Promise<void> {
   const loadOrders = SERVICE === 'all' || SERVICE === 'orders';
 
   if (loadItems) {
-    await itemsInitSchema(writePool);
+    const repo = new PgItemsRepo(writePool, readPool);
+    await repo.initSchema();
     // SEED_DEMO が設定されている場合のみシード実行（旧ステージとの後方互換を守る）。
     // Seed only when SEED_DEMO is set — preserves empty-list baseline for old stages.
-    if (SEED_DEMO) await itemsSeed(writePool);
+    if (SEED_DEMO) await repo.seed();
   }
   if (loadUsers) {
-    await usersInitSchema(writePool);
-    if (SEED_DEMO) await usersSeed(writePool);
+    const repo = new PgUsersRepo(writePool);
+    await repo.initSchema();
+    if (SEED_DEMO) await repo.seed();
   }
-  if (loadOrders) await ordersInitSchema(writePool);
+  if (loadOrders) {
+    const repo = new PgOrdersRepo(writePool);
+    await repo.initSchema();
+  }
 }
 
 async function main(): Promise<void> {

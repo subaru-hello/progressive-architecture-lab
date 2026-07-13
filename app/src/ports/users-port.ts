@@ -1,18 +1,21 @@
-import type { Pool } from 'pg';
-import { authenticate } from '../domains/users/repo.js';
-import type { User } from '../domains/users/repo.js';
+// UsersPort: orders が users ドメインにアクセスするための driven ポート。
+// UsersPort: driven port through which orders accesses the users domain.
+import type { UsersRepoPort } from '../domains/users/ports.js';
+import type { User } from '../domains/users/domain/user.js';
+
+export type { User };
 
 export interface UsersPort {
   authenticate(token: string): Promise<User | null>;
 }
 
 // インプロセスアダプタ: 同一プロセス内の users リポジトリを直接呼ぶ。
-// In-process adapter: calls users repo directly (monolith/modular-monolith).
+// In-process adapter: delegates to the users domain repo (monolith/modular-monolith).
 export class InProcessUsersAdapter implements UsersPort {
-  constructor(private readonly pool: Pool) {}
+  constructor(private readonly usersRepo: UsersRepoPort) {}
 
   authenticate(token: string): Promise<User | null> {
-    return authenticate(this.pool, token);
+    return this.usersRepo.authenticate(token);
   }
 }
 

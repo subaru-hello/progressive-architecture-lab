@@ -1,6 +1,9 @@
-import type { Pool } from 'pg';
-import { getById, decrementStock } from '../domains/items/repo.js';
-import type { Item } from '../domains/items/repo.js';
+// ItemsPort: orders が items ドメインにアクセスするための driven ポート。
+// ItemsPort: driven port through which orders accesses the items domain.
+import type { ItemsRepoPort } from '../domains/items/ports.js';
+import type { Item } from '../domains/items/domain/item.js';
+
+export type { Item };
 
 export interface ItemsPort {
   getItem(id: number): Promise<Item | null>;
@@ -8,16 +11,16 @@ export interface ItemsPort {
 }
 
 // インプロセスアダプタ: 同一プロセス内の items リポジトリを直接呼ぶ。
-// In-process adapter: calls items repo functions directly (monolith/modular-monolith).
+// In-process adapter: delegates to the items domain repo (monolith/modular-monolith).
 export class InProcessItemsAdapter implements ItemsPort {
-  constructor(private readonly pool: Pool) {}
+  constructor(private readonly itemsRepo: ItemsRepoPort) {}
 
   getItem(id: number): Promise<Item | null> {
-    return getById(this.pool, id);
+    return this.itemsRepo.getById(id);
   }
 
   decrementStock(id: number, qty: number): Promise<{ ok: boolean; stock: number }> {
-    return decrementStock(this.pool, id, qty);
+    return this.itemsRepo.decrementStock(id, qty);
   }
 }
 

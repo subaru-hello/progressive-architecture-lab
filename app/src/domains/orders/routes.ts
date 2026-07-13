@@ -1,12 +1,14 @@
+// orders HTTP アダプタ: リクエスト解析 → ユースケース呼び出し → レスポンスマッピング。
+// Orders HTTP adapter: parse request → call usecase → map response. No SQL, no business logic.
 import type { FastifyInstance } from 'fastify';
-import type { Pool } from 'pg';
 import type { UsersPort } from '../../ports/users-port.js';
 import type { ItemsPort } from '../../ports/items-port.js';
-import { listRecent } from './repo.js';
-import { createOrder, AuthError, StockError } from './service.js';
+import type { OrdersRepoPort } from './ports.js';
+import { createOrder, AuthError, StockError } from './usecase/create-order.js';
+import { listOrders } from './usecase/list-orders.js';
 
 export interface OrdersPluginOptions {
-  ordersPool: Pool;
+  ordersRepo: OrdersRepoPort;
   usersPort: UsersPort;
   itemsPort: ItemsPort;
   mode: 'join' | 'port';
@@ -14,7 +16,7 @@ export interface OrdersPluginOptions {
 }
 
 export async function ordersRoutes(app: FastifyInstance, opts: OrdersPluginOptions): Promise<void> {
-  const { ordersPool, usersPort, itemsPort, mode, INSTANCE } = opts;
+  const { ordersRepo, usersPort, itemsPort, mode, INSTANCE } = opts;
 
   app.post('/orders', async (req, reply) => {
     const token = req.headers['x-auth-token'] as string | undefined;
@@ -33,7 +35,7 @@ export async function ordersRoutes(app: FastifyInstance, opts: OrdersPluginOptio
     }
 
     try {
-      const order = await createOrder({ token, itemId, qty }, { usersPort, itemsPort, ordersPool, mode });
+      const order = await createOrder({ token, itemId, qty }, { usersPort, itemsPort, ordersRepo, mode });
       reply.code(201);
       return { instance: INSTANCE, order };
     } catch (err) {
@@ -50,7 +52,7 @@ export async function ordersRoutes(app: FastifyInstance, opts: OrdersPluginOptio
   });
 
   app.get('/orders', async () => {
-    const orders = await listRecent(ordersPool);
+    const orders = await listOrders({ ordersRepo });
     return { instance: INSTANCE, orders };
   });
 }

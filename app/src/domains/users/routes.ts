@@ -1,14 +1,15 @@
+// users HTTP アダプタ: リクエスト解析 → ユースケース呼び出し → レスポンスマッピング。
+// Users HTTP adapter: parse request → call usecase → map response. No SQL here.
 import type { FastifyInstance } from 'fastify';
-import type { Pool } from 'pg';
-import { authenticate } from './repo.js';
+import type { UsersRepoPort } from './ports.js';
 
 export interface UsersPluginOptions {
-  writePool: Pool;
+  usersRepo: UsersRepoPort;
   INSTANCE: string;
 }
 
 export async function usersRoutes(app: FastifyInstance, opts: UsersPluginOptions): Promise<void> {
-  const { writePool, INSTANCE } = opts;
+  const { usersRepo, INSTANCE } = opts;
 
   // 内部エンドポイント: HTTP アダプタ用（orders → users）。
   // Internal endpoint: for HTTP adapter (orders → users).
@@ -18,7 +19,7 @@ export async function usersRoutes(app: FastifyInstance, opts: UsersPluginOptions
       reply.code(400);
       return { error: 'token is required' };
     }
-    const user = await authenticate(writePool, body.token);
+    const user = await usersRepo.authenticate(body.token);
     if (!user) {
       reply.code(401);
       return { error: 'unauthorized' };
@@ -34,7 +35,7 @@ export async function usersRoutes(app: FastifyInstance, opts: UsersPluginOptions
       reply.code(401);
       return { error: 'x-auth-token header required' };
     }
-    const user = await authenticate(writePool, token);
+    const user = await usersRepo.authenticate(token);
     if (!user) {
       reply.code(401);
       return { error: 'unauthorized' };

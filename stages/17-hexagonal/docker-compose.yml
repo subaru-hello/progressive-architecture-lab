@@ -1,0 +1,49 @@
+# Lv17 — hexagonal monolith（mud を解きほぐした後）。ARCH=hex（既定）。
+#   [ localhost:3000 ] --> api (ARCH=hex, SERVICE=all, ORDERS_CROSS_CONTEXT=join) --> db (共有 1 Postgres)
+#
+# 狙い（引っ越し軸の「解きほぐし」）:
+#   Lv16 の泥団子(共有 tx/JOIN/跨ぎ FK)を DB/Domain/Usecase/Infra の ports & adapters に組み替えた版。
+#   トポロジ・外部 HTTP・latency は Lv13/mud と同じ——変わったのは内部構造(結合度が seam 1 本に激減)。
+#   usecase が RepoPort/ItemsPort interface にしか依存しないので、次段 Lv18 で「アダプタ差し替え+DB 移動」だけで
+#   ライブ抽出できる。hexagonal 境界＝事前に引いた移行の切断線。
+#
+# 起動: docker compose -f stages/17-hexagonal/docker-compose.yml up --build -d
+# 疎通は Lv13 と同じ（:3000）。結合度 after のカウント:
+#   grep -rnE "JOIN (items|users)|REFERENCES (items|users)" app/src/domains   # ≈0（seam は port 呼び出しに）
+# latency 不変の確認:
+#   docker run --rm -i -e BASE_URL=http://host.docker.internal:3000 grafana/k6 run - < load/orders.js
+name: pal-lv17
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pal
+      POSTGRES_PASSWORD: pal
+      POSTGRES_DB: pal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      ARCH: hex                 # 解きほぐし後（未設定でも既定 hex）
+      SERVICE: all
+      ORDERS_CROSS_CONTEXT: join
+      SEED_DEMO: "1"
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
