@@ -12,6 +12,8 @@ import { initSchema as usersInitSchema, seed as usersSeed } from './domains/user
 import { initSchema as ordersInitSchema } from './domains/orders/repo.js';
 import { InProcessItemsAdapter, HttpItemsAdapter } from './ports/items-port.js';
 import { InProcessUsersAdapter, HttpUsersAdapter } from './ports/users-port.js';
+import { mudRoutes } from './mud/routes.js';
+import { mudInitSchema, mudSeed } from './mud/schema.js';
 
 const { Pool } = pg;
 
@@ -27,8 +29,24 @@ const SERVICE = process.env.SERVICE ?? 'all';
 // ORDERS_CROSS_CONTEXT: whether orders accesses items via direct SQL ('join') or port ('port').
 const ORDERS_CROSS_CONTEXT = (process.env.ORDERS_CROSS_CONTEXT ?? 'join') as 'join' | 'port';
 
+// ARCH: アーキテクチャ選択。'mud' = ビッグボールオブマッド、'hex' = ヘキサゴナル（デフォルト）。
+// ARCH: architecture selector. 'mud' = big-ball-of-mud, 'hex' = hexagonal (default).
+const ARCH = process.env.ARCH ?? 'hex';
+if (ARCH !== 'mud' && ARCH !== 'hex') {
+  throw new Error(`ARCH must be 'mud' or 'hex', got: '${ARCH}'`);
+}
+
 const ITEMS_SERVICE_URL = process.env.ITEMS_SERVICE_URL;
 const USERS_SERVICE_URL = process.env.USERS_SERVICE_URL;
+
+// mud モードに外部サービス URL を組み合わせると「seam がない」という教訓が崩れる。
+// Combining mud with external service URLs defeats the "no seam" lesson — fail fast.
+if (ARCH === 'mud' && (ITEMS_SERVICE_URL || USERS_SERVICE_URL)) {
+  throw new Error(
+    'mud has no seam; it cannot be split by config. ' +
+    'ITEMS_SERVICE_URL / USERS_SERVICE_URL are incompatible with ARCH=mud.',
+  );
+}
 
 const writePool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -93,7 +111,7 @@ const SEED_DEMO = process.env.SEED_DEMO;
 // 直接 SQL を打つと全 order が 500 になる → 起動時に即死させる。
 // join mode + HTTP service URL is a misconfiguration: direct SQL against items table
 // will always fail when items runs as a separate service → fail fast at boot.
-if (ORDERS_CROSS_CONTEXT === 'join' && (ITEMS_SERVICE_URL || USERS_SERVICE_URL)) {
+if (ARCH === 'hex' && ORDERS_CROSS_CONTEXT === 'join' && (ITEMS_SERVICE_URL || USERS_SERVICE_URL)) {
   throw new Error(
     'ORDERS_CROSS_CONTEXT=join is incompatible with ITEMS_SERVICE_URL / USERS_SERVICE_URL. ' +
     'Use ORDERS_CROSS_CONTEXT=port for microservice deployments.',
@@ -230,53 +248,78 @@ app.get('/', async () => ({
   endpoints: ['/health', '/ready', '/metrics', '/work?ms=&cpu=', 'GET/POST /items', '/replication', '/cache'],
 }));
 
-// --- ドメインルートの登録（SERVICE env で制御）---
-// --- Domain route registration (controlled by SERVICE env) ---
-const loadItems = SERVICE === 'all' || SERVICE === 'items';
-const loadUsers = SERVICE === 'all' || SERVICE === 'users';
-const loadOrders = SERVICE === 'all' || SERVICE === 'orders';
+// --- ドメインルートの登録 ---
+// --- Domain route registration ---
 
-if (loadItems) {
-  await app.register(itemsRoutes, {
-    writePool,
-    readPool,
-    redis,
-    INSTANCE,
-    ASYNC_WRITE,
-    WRITE_QUEUE_MAX,
-    cacheHits,
-    cacheMisses,
-    cacheCounters,
-  });
+if (ARCH === 'mud') {
+  // mud モード: mud ルートだけを登録。ヘックス版ドメインは一切ロードしない。
+  // mud mode: register only mud routes; hex domain code is never loaded.
+  await app.register(mudRoutes, { writePool, INSTANCE });
+} else {
+  // hex モード（デフォルト）: SERVICE env で制御。既存動作を完全に保持。
+  // hex mode (default): controlled by SERVICE env; existing behavior fully preserved.
+  const loadItems = SERVICE === 'all' || SERVICE === 'items';
+  const loadUsers = SERVICE === 'all' || SERVICE === 'users';
+  const loadOrders = SERVICE === 'all' || SERVICE === 'orders';
+
+  if (loadItems) {
+    await app.register(itemsRoutes, {
+      writePool,
+      readPool,
+      redis,
+      INSTANCE,
+      ASYNC_WRITE,
+      WRITE_QUEUE_MAX,
+      cacheHits,
+      cacheMisses,
+      cacheCounters,
+    });
+  }
+
+  if (loadUsers) {
+    await app.register(usersRoutes, { writePool, INSTANCE });
+  }
+
+  if (loadOrders) {
+    // items ポートの選択: ITEMS_SERVICE_URL が設定されていれば HTTP アダプタ、なければインプロセス。
+    // Items port selection: HTTP adapter when ITEMS_SERVICE_URL is set, in-process otherwise.
+    const itemsPort = ITEMS_SERVICE_URL
+      ? new HttpItemsAdapter(ITEMS_SERVICE_URL)
+      : new InProcessItemsAdapter(writePool);
+
+    // users ポートの選択: USERS_SERVICE_URL が設定されていれば HTTP アダプタ、なければインプロセス。
+    // Users port selection: HTTP adapter when USERS_SERVICE_URL is set, in-process otherwise.
+    const usersPort = USERS_SERVICE_URL
+      ? new HttpUsersAdapter(USERS_SERVICE_URL)
+      : new InProcessUsersAdapter(writePool);
+
+    await app.register(ordersRoutes, {
+      ordersPool: writePool,
+      usersPort,
+      itemsPort,
+      mode: ORDERS_CROSS_CONTEXT,
+      INSTANCE,
+    });
+  }
 }
 
-if (loadUsers) {
-  await app.register(usersRoutes, { writePool, INSTANCE });
-}
-
-if (loadOrders) {
-  // items ポートの選択: ITEMS_SERVICE_URL が設定されていれば HTTP アダプタ、なければインプロセス。
-  // Items port selection: HTTP adapter when ITEMS_SERVICE_URL is set, in-process otherwise.
-  const itemsPort = ITEMS_SERVICE_URL
-    ? new HttpItemsAdapter(ITEMS_SERVICE_URL)
-    : new InProcessItemsAdapter(writePool);
-
-  // users ポートの選択: USERS_SERVICE_URL が設定されていれば HTTP アダプタ、なければインプロセス。
-  // Users port selection: HTTP adapter when USERS_SERVICE_URL is set, in-process otherwise.
-  const usersPort = USERS_SERVICE_URL
-    ? new HttpUsersAdapter(USERS_SERVICE_URL)
-    : new InProcessUsersAdapter(writePool);
-
-  await app.register(ordersRoutes, {
-    ordersPool: writePool,
-    usersPort,
-    itemsPort,
-    mode: ORDERS_CROSS_CONTEXT,
-    INSTANCE,
-  });
-}
-
+// initDb は ARCH ごとに異なるスキーマを初期化する。
+// initDb initializes the schema appropriate for the current ARCH.
 async function initDb(): Promise<void> {
+  if (ARCH === 'mud') {
+    // mud モード: 3 ドメインを FK で繋いだ一体型スキーマ。
+    // mud mode: monolithic schema with cross-domain FKs.
+    await mudInitSchema(writePool);
+    if (SEED_DEMO) await mudSeed(writePool);
+    return;
+  }
+
+  // hex モード: SERVICE env で制御された個別スキーマ初期化（既存動作そのまま）。
+  // hex mode: per-domain schema init controlled by SERVICE env (existing behavior).
+  const loadItems = SERVICE === 'all' || SERVICE === 'items';
+  const loadUsers = SERVICE === 'all' || SERVICE === 'users';
+  const loadOrders = SERVICE === 'all' || SERVICE === 'orders';
+
   if (loadItems) {
     await itemsInitSchema(writePool);
     // SEED_DEMO が設定されている場合のみシード実行（旧ステージとの後方互換を守る）。
@@ -326,9 +369,10 @@ async function main(): Promise<void> {
   // the replica before `items` exists and 500 (cold-start read-after-write). Wait until
   // the table is visible on readPool. When readPool == writePool (Lv0–4) this passes on
   // the first try. to_regclass returns NULL (not an error) when the table is absent.
-  // items ドメインをロードしているときだけレプリカ可視性チェックを行う。
-  // Replica visibility check only when items domain is loaded.
-  if (loadItems) {
+  // items ドメインをロードしているときだけレプリカ可視性チェックを行う (mud も items を持つ)。
+  // Replica visibility check only when items is present (mud always has items; hex checks SERVICE).
+  const itemsVisible = ARCH === 'mud' || SERVICE === 'all' || SERVICE === 'items';
+  if (itemsVisible) {
     for (let attempt = 1; ; attempt++) {
       try {
         const { rows } = await readPool.query(`SELECT to_regclass('public.items') AS t`);

@@ -1,0 +1,52 @@
+# Lv16 — 泥団子(big ball of mud) monolith。ARCH=mud で「絡んだ」実装を mount。
+#   [ localhost:3000 ] --> api (ARCH=mud, SERVICE=all) --> db (共有 1 Postgres・全ドメイン同居)
+#
+# 狙い（引っ越し軸の出発点）:
+#   故意に結合させた mud を作り、「泥団子は綺麗にする前には live で動かせない」を実測する。
+#   - POST /orders は items 在庫 + orders + users(last_order_at) を 1 tx で 3 テーブル横断（共有 tx）。
+#   - GET /orders は orders JOIN items JOIN users（cross-domain JOIN）。
+#   - orders.item_id / user_id は items(id)/users(id) への跨ぎ FK。
+#   → items を別 DB に「引っ越そう」とすると JOIN が跨げず・FK が分割を拒否 → /orders が壊れる。
+#     この破綻を Lv18(hex を live で移す)の成功と対比する。
+#
+# 起動: docker compose -f stages/16-mud/docker-compose.yml up --build -d
+# 疎通: TOKEN=demo-token-1
+#   curl -s -XPOST localhost:3000/orders -H "x-auth-token: $TOKEN" -H 'content-type: application/json' -d '{"itemId":1,"qty":1}'
+#   curl -s localhost:3000/orders     # item_name/user_name まで JOIN で埋まる（=結合の証拠）
+# 結合度カウント（静的・migratability の代理指標）:
+#   grep -nE "JOIN (items|users|orders)|REFERENCES (items|users)" app/src/mud/*.ts
+# 負荷: docker run --rm -i -e BASE_URL=http://host.docker.internal:3000 grafana/k6 run - < load/migration.js
+name: pal-lv16
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pal
+      POSTGRES_PASSWORD: pal
+      POSTGRES_DB: pal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pal -d pal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      ARCH: mud                 # ← 泥団子実装を mount（未設定=hex で従来どおり）
+      SERVICE: all
+      SEED_DEMO: "1"
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

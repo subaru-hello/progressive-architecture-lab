@@ -29,3 +29,4 @@
 - [Lv13 — monolith（多ドメイン app のベースライン）：cross-context を直 SQL JOIN で in-process 解決](13-lv13.md)
 - [Lv14 — modular monolith：env 1 個差で schema 結合を runtime 無料で切る（latency は不変）](14-lv14.md)
 - [Lv15 — microservices：分解の対価を回収（network 税は小・本体は idle 3.3×/原子性喪失/blast-radius 隔離）](15-lv15.md)
+- [Lv16 — 泥団子と「動かせなさ」：引っ越しやすさ＝結合度（naive 移行は 100% ダウン・跨ぎ FK が抽出を拒否）](16-lv16.md)
