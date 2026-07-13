@@ -1,0 +1,60 @@
+# Lv18 — ダウンタイムゼロ抽出（strangler-fig）。hex seam から items をライブ抽出する。
+#   monolith(:3000, SERVICE=all, port モード) --DualWriteItemsAdapter--> items-service(別プロセス+別DB)
+#   monolith 自身の DB(db) が items+orders+users を持つ。items-service は空で起動し backfill で埋める。
+#   orders→items の依存を「runtime の migration mode」で切替 = プロセス再起動ゼロ = 真のゼロダウンタイム。
+#
+# phase（全て monolith への admin curl・再起動なし。k6 を常時流し error≈0 を確認）:
+#   primary_only(baseline) → dual_write → backfill → dual_shadow → secondary_only(cutover) → (contract)
+#   admin: curl -XPOST :3000/admin/items-migration/mode -d '{"mode":"dual_write"}'
+#   backfill: curl -s :3000/internal/items/all | curl -XPOST :3001/internal/items/bulk-upsert -d @-   (下記 README 参照)
+#
+# 起動: docker compose -f stages/18-live-extraction/docker-compose.yml up --build -d
+# 負荷: docker run --rm -i -e BASE_URL=http://host.docker.internal:3000 -e PHASE=<phase> grafana/k6 run - < load/migration.js
+name: pal-lv18
+
+services:
+  db:                       # monolith 共有 DB（items+orders+users）
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: pal, POSTGRES_PASSWORD: pal, POSTGRES_DB: pal }
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U pal -d pal"], interval: 5s, timeout: 3s, retries: 10 }
+
+  items-db:                 # 抽出先: items-service 専用 DB（空で起動）
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: pal, POSTGRES_PASSWORD: pal, POSTGRES_DB: pal }
+    volumes: [items-pgdata:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U pal -d pal"], interval: 5s, timeout: 3s, retries: 10 }
+
+  items-service:            # 抽出先サービス（SERVICE=items・seed しない=backfill で埋める）
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@items-db:5432/pal
+      ARCH: hex
+      SERVICE: items
+      PORT: "3000"
+    ports:
+      - "3001:3000"          # backfill/検証のため host からも見えるように
+    depends_on:
+      items-db: { condition: service_healthy }
+
+  api:                      # monolith（抽出元）。orders→items は DualWriteItemsAdapter 経由。
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      ARCH: hex
+      SERVICE: all
+      ORDERS_CROSS_CONTEXT: port          # dual-write は port モードでのみ成立（join は port を迂回）
+      ITEMS_SERVICE_URL: http://items-service:3000
+      ITEMS_MIGRATION_MODE: primary_only  # 初期モード（admin で runtime 切替）
+      SEED_DEMO: "1"                        # monolith 側に demo items+users を seed
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      db: { condition: service_healthy }
+      items-service: { condition: service_started }
+
+volumes:
+  pgdata:
+  items-pgdata:

@@ -31,3 +31,4 @@
 - [Lv15 — microservices：分解の対価を回収（network 税は小・本体は idle 3.3×/原子性喪失/blast-radius 隔離）](15-lv15.md)
 - [Lv16 — 泥団子と「動かせなさ」：引っ越しやすさ＝結合度（naive 移行は 100% ダウン・跨ぎ FK が抽出を拒否）](16-lv16.md)
 - [Lv17 — 解きほぐし（mud → hexagonal）：結合を seam 1 本に落とす（層化は runtime 無料・境界＝事前の切断線）](17-lv17.md)
+- [Lv18 — ダウンタイムゼロ抽出（strangler-fig）：hex を live で移す（規律=0% / naive=66.7% / 泥団子=100% ダウン）](18-lv18.md)

@@ -10,7 +10,8 @@ import { ordersRoutes } from './domains/orders/routes.js';
 import { PgItemsRepo } from './domains/items/infra/pg-items-repo.js';
 import { PgUsersRepo } from './domains/users/infra/pg-users-repo.js';
 import { PgOrdersRepo } from './domains/orders/infra/pg-orders-repo.js';
-import { InProcessItemsAdapter, HttpItemsAdapter } from './ports/items-port.js';
+import { InProcessItemsAdapter, HttpItemsAdapter, DualWriteItemsAdapter, MIGRATION_MODES } from './ports/items-port.js';
+import type { MigrationMode } from './ports/items-port.js';
 import { InProcessUsersAdapter, HttpUsersAdapter } from './ports/users-port.js';
 import { mudRoutes } from './mud/routes.js';
 import { mudInitSchema, mudSeed } from './mud/schema.js';
@@ -38,6 +39,15 @@ if (ARCH !== 'mud' && ARCH !== 'hex') {
 
 const ITEMS_SERVICE_URL = process.env.ITEMS_SERVICE_URL;
 const USERS_SERVICE_URL = process.env.USERS_SERVICE_URL;
+
+// Lv18: 移行モード。ITEMS_SERVICE_URL と組み合わせてのみ有効。未設定 → デフォルト動作を保持。
+// Lv18: migration mode — only effective when ITEMS_SERVICE_URL is also set. Unset → default unchanged.
+const ITEMS_MIGRATION_MODE = (process.env.ITEMS_MIGRATION_MODE ?? 'primary_only') as MigrationMode;
+if (!MIGRATION_MODES.includes(ITEMS_MIGRATION_MODE)) {
+  throw new Error(
+    `ITEMS_MIGRATION_MODE must be one of ${MIGRATION_MODES.join(', ')}, got: '${ITEMS_MIGRATION_MODE}'`,
+  );
+}
 
 // mud モードに外部サービス URL を組み合わせると「seam がない」という教訓が崩れる。
 // Combining mud with external service URLs defeats the "no seam" lesson — fail fast.
@@ -158,6 +168,18 @@ const workerBusy = new client.Gauge({
 const writeQueueDepth = new client.Gauge({
   name: 'write_queue_depth',
   help: 'Number of pending entries in the write-behind Redis Stream (items:writes)',
+  registers: [register],
+});
+// Lv18 移行メトリクス: シャドウ読み取り不一致 / セカンダリ書き込みエラー。
+// Lv18 migration metrics: shadow-read divergences / secondary write errors.
+const shadowMismatch = new client.Counter({
+  name: 'shadow_mismatch_total',
+  help: 'Number of shadow-read divergences between primary and secondary items data (Lv18)',
+  registers: [register],
+});
+const dualWriteSecondaryError = new client.Counter({
+  name: 'dual_write_secondary_error_total',
+  help: 'Number of best-effort secondary write errors during dual-write phase (Lv18)',
   registers: [register],
 });
 
@@ -287,11 +309,35 @@ if (ARCH === 'mud') {
   if (loadOrders) {
     const ordersRepo = new PgOrdersRepo(writePool);
 
-    // items ポートの選択: ITEMS_SERVICE_URL が設定されていれば HTTP アダプタ、なければインプロセス。
-    // Items port selection: HTTP adapter when ITEMS_SERVICE_URL is set, in-process otherwise.
-    const itemsPort = ITEMS_SERVICE_URL
-      ? new HttpItemsAdapter(ITEMS_SERVICE_URL)
-      : new InProcessItemsAdapter(itemsRepo);
+    // Lv18 guard: join モードは itemsPort をバイパスするためデュアルライトと共存不可。
+    // Lv18 guard: join mode bypasses itemsPort so it cannot mirror writes — fail fast.
+    if (ORDERS_CROSS_CONTEXT === 'join' && ITEMS_SERVICE_URL) {
+      throw new Error(
+        'ORDERS_CROSS_CONTEXT=join bypasses itemsPort and cannot mirror writes to ITEMS_SERVICE_URL. ' +
+        'Use ORDERS_CROSS_CONTEXT=port for Lv18 migration.',
+      );
+    }
+
+    // items ポートの選択（Lv18 拡張）:
+    // Items port selection (Lv18 extended):
+    //   ITEMS_SERVICE_URL あり → DualWriteItemsAdapter (モードは ITEMS_MIGRATION_MODE で制御)
+    //   なし → InProcess (デフォルト; Lv0-17 との後方互換を保持)
+    let itemsPort: InProcessItemsAdapter | DualWriteItemsAdapter;
+    let dualAdapter: DualWriteItemsAdapter | null = null;
+    if (ITEMS_SERVICE_URL) {
+      dualAdapter = new DualWriteItemsAdapter(
+        new InProcessItemsAdapter(itemsRepo),
+        new HttpItemsAdapter(ITEMS_SERVICE_URL),
+        {
+          initialMode: ITEMS_MIGRATION_MODE,
+          onMismatch: () => { shadowMismatch.inc(); },
+          onSecondaryError: () => { dualWriteSecondaryError.inc(); },
+        },
+      );
+      itemsPort = dualAdapter;
+    } else {
+      itemsPort = new InProcessItemsAdapter(itemsRepo);
+    }
 
     // users ポートの選択: USERS_SERVICE_URL が設定されていれば HTTP アダプタ、なければインプロセス。
     // Users port selection: HTTP adapter when USERS_SERVICE_URL is set, in-process otherwise.
@@ -306,6 +352,27 @@ if (ARCH === 'mud') {
       mode: ORDERS_CROSS_CONTEXT,
       INSTANCE,
     });
+
+    // Lv18 管理エンドポイント: ランタイムで移行モードを切り替える（コンテナ再起動不要）。
+    // Lv18 admin endpoints: flip migration mode at runtime — zero restart needed.
+    // モノリス (SERVICE=all) かつ DualWriteAdapter が有効なときのみ登録。
+    // Only registered when the dual-write adapter is active on the monolith (SERVICE=all).
+    if (dualAdapter && loadItems) {
+      const adapter = dualAdapter; // narrow for closure
+      app.get('/admin/items-migration/mode', async () => ({ mode: adapter.getMode() }));
+      app.post('/admin/items-migration/mode', async (req, reply) => {
+        const body = req.body as { mode?: string };
+        if (!body?.mode || !MIGRATION_MODES.includes(body.mode as MigrationMode)) {
+          reply.code(400);
+          return {
+            error: `mode must be one of: ${MIGRATION_MODES.join(', ')}`,
+            current: adapter.getMode(),
+          };
+        }
+        adapter.setMode(body.mode as MigrationMode);
+        return { mode: adapter.getMode() };
+      });
+    }
   }
 }
 

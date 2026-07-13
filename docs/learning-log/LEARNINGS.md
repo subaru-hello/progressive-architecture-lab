@@ -3,7 +3,7 @@
 各段の詳細ログ（`NN-*.md`）から、**転用できる教訓だけ**を抜き出して蓄積するファイル。
 段を進めるたびにここへ追記する。各項目に出所の段を `[Lv?]` で付す。
 
-最終更新: 2026-07-13（Lv17 — 解きほぐし(hexagonal)。結合を seam 1 本に）
+最終更新: 2026-07-13（Lv18 — ダウンタイムゼロ抽出(strangler)。0% で live 移行）
 
 ---
 
@@ -266,6 +266,17 @@ env 1 個で port に切替可・usecase/domain は無変更）。**これがそ
 orders でこそ価値を持つ**、thin CRUD(items/users)に passthrough usecase を敷くのは泥団子の逆の過剰設計。
 ②**並行性を持つ不変条件(在庫充足)は純 domain 述語(canFulfil=check-then-act の race)にせず DB の atomic guard に置く**。
 教訓35「引っ越しやすさ＝結合度」の解決編（→ Lv18 で同じ引っ越しが今度は live で通る）。
+
+## 37. ⭐ ゼロダウンタイム移行は「切れる構造(seam)」×「切る手順(playbook)」の積 — 片方でも欠けると落ちる `[Lv18]`
+Lv17 の hex seam(orders→items が ItemsPort 1 本)から items を専用サービス+専用DBへ**ライブ抽出**。`DualWriteItemsAdapter`
+に **runtime の migration mode**(admin endpoint で切替＝再起動ゼロ)を持たせ、strangler フル playbook
+(primary_only→dual_write→backfill→dual_shadow→**cutover=secondary_only**→contract)を k6 常時流しで通した。
+**Lv16 の泥団子で 100% ダウンした同じ引っ越しが、hex では全 phase 0%**。決め手3つ: ①**下地(結合度)**——seam が
+アダプタ 1 本だから in-process→dual-write→HTTP を**プロセスを止めず**差し替えられた(hexagonal 境界＝事前の切断線・教訓36の回収)。
+②**手順**——同じ hex でも naive(dual_write/backfill/shadow を飛ばし空の新ストアへ即 cutover)は **66.7% ダウン**(在庫があるのに
+全 order が 409)＝seam だけでは足りない。③**verify(shadow-read)が cutover の安全装置**——`shadow_mismatch=0` を計測で
+確認してから切替えた(推測でなく計測で可否を決める・教訓6 の移行版)。罠: dual_write を backfill の**前**に有効化しないと
+drift 窓が開く/dual_write は非冪等でリトライ二重デクリメント(Lv19 の宿題)/cutover は残る cross-DB 原子性を本番化(→ Lv19)。
 
 ---
 

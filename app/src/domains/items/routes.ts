@@ -156,4 +156,23 @@ export async function itemsRoutes(app: FastifyInstance, opts: ItemsPluginOptions
     }
     return { ok: true, stock: result.stock };
   });
+
+  // Lv18 バックフィル用: 全 item 取得（LIMIT なし）。ストラングラーフィグ移行時のソース DB 読み取り。
+  // Lv18 backfill: fetch ALL items (no LIMIT) — read source-of-truth during strangler-fig migration.
+  app.get('/internal/items/all', async () => {
+    const items = await itemsRepo.listAll();
+    return { items };
+  });
+
+  // Lv18 バックフィル用: id 保持の冪等 bulk upsert。移行先 DB へのデータ投入に使う。
+  // Lv18 backfill: idempotent bulk upsert preserving ids — used to populate the target DB.
+  app.post('/internal/items/bulk-upsert', async (req, reply) => {
+    const body = req.body as { items?: { id: number; name: string; stock: number; created_at: string }[] };
+    if (!Array.isArray(body?.items)) {
+      reply.code(400);
+      return { error: 'items array is required' };
+    }
+    const upserted = await itemsRepo.bulkUpsert(body.items);
+    return { upserted };
+  });
 }

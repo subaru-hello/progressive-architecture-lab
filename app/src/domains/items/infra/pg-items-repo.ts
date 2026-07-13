@@ -28,6 +28,50 @@ export class PgItemsRepo implements ItemsRepoPort {
     return rows;
   }
 
+  // Lv18 バックフィル: LIMIT なしで全件返す（ソース DB 読み取り用）。
+  // Lv18 backfill: return all rows without LIMIT (for reading the source-of-truth DB).
+  async listAll(): Promise<Item[]> {
+    const { rows } = await this.readPool.query(
+      'SELECT id, name, stock, created_at FROM items ORDER BY id',
+    );
+    return rows;
+  }
+
+  // Lv18 バックフィル: id 保持の冪等 upsert。INSERT と setval を同一トランザクションで実行。
+  // Lv18 backfill: idempotent upsert preserving explicit ids. INSERT + setval in one transaction
+  // so the sequence is always consistent with MAX(id) — mirrors the pattern used by seed().
+  async bulkUpsert(rows: Pick<Item, 'id' | 'name' | 'stock' | 'created_at'>[]): Promise<number> {
+    if (rows.length === 0) return 0;
+    const values: string[] = [];
+    const params: (number | string)[] = [];
+    let p = 1;
+    for (const row of rows) {
+      values.push(`($${p++}, $${p++}, $${p++}, $${p++})`);
+      params.push(row.id, row.name, row.stock, row.created_at);
+    }
+    const c = await this.writePool.connect();
+    try {
+      await c.query('BEGIN');
+      await c.query(
+        `INSERT INTO items (id, name, stock, created_at) VALUES ${values.join(', ')}
+         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, stock = EXCLUDED.stock`,
+        params,
+      );
+      // 早期リターン済みなのでここに来た時点で MAX(id) は必ず non-null。
+      // Early-return guarantees rows.length > 0, so MAX(id) is non-null here.
+      await c.query(
+        `SELECT setval(pg_get_serial_sequence('items','id'), (SELECT MAX(id) FROM items))`,
+      );
+      await c.query('COMMIT');
+    } catch (err) {
+      await c.query('ROLLBACK');
+      throw err;
+    } finally {
+      c.release();
+    }
+    return rows.length;
+  }
+
   async getById(id: number): Promise<Item | null> {
     const { rows } = await this.readPool.query(
       'SELECT id, name, stock, created_at FROM items WHERE id = $1',
