@@ -7,6 +7,9 @@ export interface Order {
   item_id: number;
   qty: number;
   created_at: string;
+  // Lv23 choreography saga: 注文ステータス。既存 SQL は DEFAULT 'confirmed' に落ちるため後方互換。
+  // Lv23 choreography saga: order status. Existing SQL omits it and gets DEFAULT 'confirmed'.
+  status?: string;
 }
 
 // qty が正の整数であることを保証する。ドメイン不変条件（純関数）。

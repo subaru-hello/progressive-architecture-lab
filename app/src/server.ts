@@ -12,8 +12,8 @@ import { PgUsersRepo } from './domains/users/infra/pg-users-repo.js';
 import { PgOrdersRepo } from './domains/orders/infra/pg-orders-repo.js';
 import { InProcessItemsAdapter, HttpItemsAdapter, DualWriteItemsAdapter, MIGRATION_MODES } from './ports/items-port.js';
 import type { MigrationMode } from './ports/items-port.js';
-import { TX_MODES } from './domains/orders/usecase/create-order.js';
-import type { TxMode } from './domains/orders/usecase/create-order.js';
+import { TX_MODES, SAGA_STYLES } from './domains/orders/usecase/create-order.js';
+import type { TxMode, SagaStyle } from './domains/orders/usecase/create-order.js';
 import { InProcessUsersAdapter, HttpUsersAdapter } from './ports/users-port.js';
 import { mudRoutes } from './mud/routes.js';
 import { mudInitSchema, mudSeed } from './mud/schema.js';
@@ -60,6 +60,17 @@ if (!TX_MODES.includes(ORDER_TX_MODE)) {
 if ((ORDER_TX_MODE === '2pc' || ORDER_TX_MODE === 'saga') && !ITEMS_SERVICE_URL) {
   throw new Error(`ORDER_TX_MODE=${ORDER_TX_MODE} requires ITEMS_SERVICE_URL to be set`);
 }
+
+// Lv23: saga スタイル。ORDER_TX_MODE=saga の時のみ意味を持つ。
+// Lv23: saga style — only meaningful when ORDER_TX_MODE=saga. Default: orchestration.
+const SAGA_STYLE = (process.env.SAGA_STYLE ?? 'orchestration') as SagaStyle;
+if (!SAGA_STYLES.includes(SAGA_STYLE)) {
+  throw new Error(`SAGA_STYLE must be one of ${SAGA_STYLES.join(', ')}, got: '${SAGA_STYLE}'`);
+}
+
+// Lv23: items → orders コールバック URL (choreography の双方向結合)。
+// Lv23: items-to-orders callback URL (bidirectional coupling unique to choreography).
+const ORDERS_EVENTS_URL = process.env.ORDERS_EVENTS_URL;
 
 // Lv19 フォルトインジェクション。
 // Lv19 fault injection: '' = off; 'after-first-write' | 'after-prepare-all' = inject fault.
@@ -212,6 +223,11 @@ let sagaPoller: ReturnType<typeof setInterval> | null = null;
 // Lv22 outbox poller: started only in outbox mode when orders are loaded.
 let outboxPoller: ReturnType<typeof setInterval> | null = null;
 
+// Lv23 choreography ポーラー: saga+choreography 時に orders/items 双方で起動。
+// Lv23 choreography pollers: started in saga+choreography mode for both orders and items sides.
+let choreoOrdersPoller: ReturnType<typeof setInterval> | null = null;
+let choreoItemsPoller: ReturnType<typeof setInterval> | null = null;
+
 const app = Fastify({ logger: true });
 
 // onResponse フックは全ルートに適用されるよう、プラグイン登録より前に addHook する。
@@ -332,6 +348,42 @@ if (ARCH === 'mud') {
       cacheMisses,
       cacheCounters,
     });
+
+    // Lv23 choreography items ポーラー: choreo_outbox(items-db) の未配送を orders へ配送。
+    // 起動条件: ORDERS_EVENTS_URL が設定されている場合のみ (items 側は ORDERS_EVENTS_URL の有無で判定)。
+    // Lv23 choreography items poller: deliver StockReserved/StockRejected events to orders-service.
+    // Start condition: ORDERS_EVENTS_URL is set (items side uses URL presence, not SAGA_STYLE).
+    // SERVICE==='items' でのみ起動 (SERVICE=all で items も載る monolith に ORDERS_EVENTS_URL を渡しても
+    // 自己ループ配送しないよう構造的にガード。env 衛生だけに頼らない)。
+    if (ORDERS_EVENTS_URL && SERVICE === 'items') {
+      const pollerItemsRepo = itemsRepo;
+      const pollerOrdersEventsUrl = ORDERS_EVENTS_URL;
+
+      choreoItemsPoller = setInterval(async () => {
+        try {
+          const rows = await pollerItemsRepo.claimUndeliveredChoreoOutbox(50);
+          for (const r of rows) {
+            try {
+              // orders が consume する StockReserved/StockRejected を orders の受信 endpoint へ。
+              const res = await fetch(`${pollerOrdersEventsUrl}/internal/choreo/stock-events`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ msgId: r.msg_id, eventType: r.event_type, payload: r.payload }),
+                signal: AbortSignal.timeout(5000),
+              });
+              if (!res.ok) throw new Error(`orders choreo endpoint returned ${res.status}`);
+              await pollerItemsRepo.markChoreoOutboxDelivered(r.msg_id);
+            } catch (e) {
+              app.log.warn({ msg_id: r.msg_id, err: e }, 'choreo items poller: delivery failed, will retry');
+            }
+          }
+        } catch (e) {
+          app.log.warn({ err: e }, 'choreo items poller: claim failed');
+        }
+      }, 2000);
+    }
+    // ORDERS_EVENTS_URL 未設定: items choreo poller は起動しない (警告不要 — 非 choreography 配備では正常)。
+    // ORDERS_EVENTS_URL not set: items choreo poller stays off (no warning — normal for non-choreo deployments).
   }
 
   if (loadUsers) {
@@ -386,6 +438,9 @@ if (ARCH === 'mud') {
       // Lv19: port モードのみ有効。join モードでは txMode は無視。
       // Lv19: txMode only meaningful in port mode; ignored for join mode.
       txMode: ORDERS_CROSS_CONTEXT === 'port' ? ORDER_TX_MODE : 'none',
+      // Lv23: saga + choreography 時のみ有効。
+      // Lv23: only meaningful when txMode=saga.
+      sagaStyle: SAGA_STYLE,
       fault: { faultPoint: FAULT_POINT },
     });
 
@@ -472,6 +527,37 @@ if (ARCH === 'mud') {
           }
         } catch (e) {
           app.log.warn({ err: e }, 'outbox poller: claim failed');
+        }
+      }, 2000);
+    }
+
+    // Lv23 choreography orders ポーラー: choreo_outbox(orders-db) の未配送を items へ配送。
+    // Lv23 choreography orders poller: deliver undelivered OrderCreated events to items-service.
+    if (ORDER_TX_MODE === 'saga' && SAGA_STYLE === 'choreography' && ITEMS_SERVICE_URL) {
+      const pollerOrdersRepo = ordersRepo;
+      const pollerItemsUrl = ITEMS_SERVICE_URL;
+
+      choreoOrdersPoller = setInterval(async () => {
+        try {
+          const rows = await pollerOrdersRepo.claimUndeliveredChoreoOutbox(50);
+          for (const r of rows) {
+            try {
+              const payload = r.payload as { orderId: number; itemId: number; qty: number };
+              // items が consume する OrderCreated を items の受信 endpoint へ。
+              const res = await fetch(`${pollerItemsUrl}/internal/choreo/order-events`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ msgId: r.msg_id, eventType: r.event_type, payload }),
+                signal: AbortSignal.timeout(5000),
+              });
+              if (!res.ok) throw new Error(`items choreo endpoint returned ${res.status}`);
+              await pollerOrdersRepo.markChoreoOutboxDelivered(r.msg_id);
+            } catch (e) {
+              app.log.warn({ msg_id: r.msg_id, err: e }, 'choreo orders poller: delivery failed, will retry');
+            }
+          }
+        } catch (e) {
+          app.log.warn({ err: e }, 'choreo orders poller: claim failed');
         }
       }, 2000);
     }
@@ -590,6 +676,10 @@ async function initDb(): Promise<void> {
     // Lv22 outbox: outbox テーブルを常に作成 (MODE 非依存)。
     // Lv22 outbox: always create outbox table (mode-independent).
     await repo.initOutboxSchema();
+    // Lv23 choreography: choreo_outbox + processed_messages(orders-db) を常に作成 (MODE 非依存)。
+    // Lv23 choreography: always create choreo_outbox + orders-db processed_messages (mode-independent).
+    await repo.initChoreoSchema();
+    await repo.initOrdersInboxSchema();
   }
   if (loadItems) {
     // Lv19 saga: reservations は items ドメインが所有するテーブル。
@@ -603,6 +693,9 @@ async function initDb(): Promise<void> {
     // Lv22 outbox: processed_messages は items ドメインが所有するテーブル (冪等 receiver 用)。
     // Lv22 outbox: processed_messages is owned by the items domain (idempotent receiver inbox).
     await repo.initInboxSchema();
+    // Lv23 choreography: choreo_outbox を items-db にも作成 (MODE 非依存)。
+    // Lv23 choreography: create choreo_outbox on items-db too (mode-independent).
+    await repo.initChoreoSchema();
   }
 }
 
@@ -684,6 +777,10 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     // Lv22 outbox ポーラーを停止。
     // Lv22: stop the outbox poller before closing connections.
     if (outboxPoller !== null) clearInterval(outboxPoller);
+    // Lv23 choreography ポーラーを停止。
+    // Lv23: stop choreography pollers before closing connections.
+    if (choreoOrdersPoller !== null) clearInterval(choreoOrdersPoller);
+    if (choreoItemsPoller !== null) clearInterval(choreoItemsPoller);
     try {
       await app.close();
       await Promise.all([writePool.end(), readPool.end(), ...(redis ? [redis.quit()] : []), ...(pool ? [pool.destroy()] : [])]);

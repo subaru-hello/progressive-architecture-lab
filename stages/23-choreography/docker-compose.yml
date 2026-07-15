@@ -1,0 +1,76 @@
+# Lv23 — choreography saga。Lv19 の saga は orchestration(中央 coordinator が指揮)。
+#   choreography は各サービスがイベントを発行し合い、中央指揮者なしで状態遷移する。
+#   フローがどの単一関数にも無い代わりに、items が orders にコールバックする=双方向結合。
+#
+#   POST /orders → orders: order(status=pending) + OrderCreated を emit(同一tx)
+#     → orders poller → items /internal/choreo/events (OrderCreated)
+#       → items: 在庫チェック → StockReserved | StockRejected を emit(同一tx)
+#         → items poller → orders /internal/choreo/events (StockReserved/Rejected)
+#           → orders: status pending→confirmed | cancelled
+#
+#   ★ 双方向配線: items-service に ORDERS_EVENTS_URL=http://api:3000 を渡す(items→orders のコールバック)。
+#     orchestration(SAGA_STYLE=orchestration)は片方向で、これは不要。
+#
+# 使い方:
+#   起動:  docker compose -f stages/23-choreography/docker-compose.yml up --build -d
+#   happy: curl -s -X POST localhost:3023/orders -H 'x-auth-token: demo-token-1' -H 'content-type: application/json' -d '{"itemId":3,"qty":5}'
+#          # → 201 (status=pending)。数秒後にイベントが流れて status=confirmed・stock -5
+#   reject(在庫不足で補償): ... -d '{"itemId":3,"qty":2000000}'   # stock 100万 < 200万 → StockRejected → status=cancelled・stock 不変
+#
+# 確認(フローが分散している様子):
+#   docker compose ... exec db       psql -U pal -d pal -c "SELECT id,status FROM orders;"
+#   docker compose ... exec db       psql -U pal -d pal -c "SELECT event_type,delivered_at FROM choreo_outbox;"       # orders→items
+#   docker compose ... exec items-db psql -U pal -d pal -c "SELECT event_type,delivered_at FROM choreo_outbox;"       # items→orders
+#   docker compose ... exec items-db psql -U pal -d pal -c "SELECT stock FROM items WHERE id=3;"
+#
+# orchestration 版と対比:  ORDER_TX_MODE=saga SAGA_STYLE=orchestration ...(items は reserve/release・items→orders コールバック無し)
+name: pal-lv23
+
+services:
+  db:                       # orders(+status) + choreo_outbox + processed_messages
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: pal, POSTGRES_PASSWORD: pal, POSTGRES_DB: pal }
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U pal -d pal"], interval: 5s, timeout: 3s, retries: 10 }
+    volumes: [pgdata:/var/lib/postgresql/data]
+
+  items-db:                 # items + choreo_outbox + processed_messages
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: pal, POSTGRES_PASSWORD: pal, POSTGRES_DB: pal }
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U pal -d pal"], interval: 5s, timeout: 3s, retries: 10 }
+    volumes: [items-pgdata:/var/lib/postgresql/data]
+
+  items-service:            # SERVICE=items。ORDERS_EVENTS_URL で orders にコールバック(choreography の双方向結合)。
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@items-db:5432/pal
+      ARCH: hex
+      SERVICE: items
+      SEED_DEMO: "1"
+      ORDERS_EVENTS_URL: http://api:3000    # ★ items→orders のイベント配送先(choreography 専用)
+      PORT: "3000"
+    depends_on:
+      items-db: { condition: service_healthy }
+
+  api:                      # coordinator。saga + choreography。
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      ARCH: hex
+      SERVICE: all
+      ORDERS_CROSS_CONTEXT: port
+      ITEMS_SERVICE_URL: http://items-service:3000
+      ITEMS_MIGRATION_MODE: secondary_only
+      ORDER_TX_MODE: saga
+      SAGA_STYLE: ${SAGA_STYLE:-choreography}    # choreography | orchestration(対比用)
+      SEED_DEMO: "1"
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    ports:
+      - "3023:3000"
+    depends_on:
+      db: { condition: service_healthy }
+      items-service: { condition: service_started }
+
+volumes:
+  pgdata:
+  items-pgdata:

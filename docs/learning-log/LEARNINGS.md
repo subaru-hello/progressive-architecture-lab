@@ -349,6 +349,26 @@ transactional outbox で潰した(app のみ・外部契約不変):
 
 ---
 
+## 42. ⭐ orchestration ↔ choreography は「制御の所在」の取引 — 散らすと結合は減るが「フローがどこにも無い」観測性の税を払う `[Lv23]`
+Lv19 saga(orchestration=`createOrderSaga()` に全フロー)に対し、中央指揮者を消してイベント駆動にした choreography を追加
+(`SAGA_STYLE=choreography`・orchestration は不変)。Lv22 の outbox/inbox を両サービスに置き双方向化:
+orders `OrderCreated`(order=pending+emit を同一tx) → orders poller → items → 在庫チェックし `StockReserved`/`StockRejected` emit
+(同一tx) → items poller → orders → status を confirmed/cancelled。
+- **実測**: happy=OrderCreated→StockReserved→confirmed(stock 減)。reject=在庫不足→StockRejected→cancelled(stock 不変=補償)。
+- **①制御の所在の取引**: 中央に集める(1 関数で読める/変更容易/でも coordinator が全員を知りボトルネック)か、散らす(疎結合/
+  ボトルネック無し/でもフローが emergent で 8 ファイルに散り「どこにも書いてない」)か。**複雑さを消すのでなく置き場所を選ぶ**
+  (教訓33 の再演)。choreography の観測性・デバッグ税は過小評価されがち —— コードを読んでも 1 注文の物語が追えない。
+- **②結合が「関数呼び出し」から「トポロジ」へ移る**: orchestration は片方向(coordinator→participant)、choreography は
+  participant も発行元にコールバック(`ORDERS_EVENTS_URL`)＝ everyone-talks-to-everyone。消えたのはコンパイル時結合で、
+  実行時の相互依存(誰がどのイベントを待つか)はむしろ増える。
+- **③実際に踏んだ罠(qa 指摘)**: 両受信 endpoint を同名 `/internal/choreo/events` にしたら `SERVICE=all` で同一 Fastify に
+  両ドメインが載り `FST_ERR_DUPLICATED_ROUTE`→**Lv13-23 全 hex 段が起動不能**。パス分離で解決。イベント endpoint は増殖し
+  名前空間を切らないと衝突する＝「散らすことの管理コスト」の実例。
+- **[分散tx 軸 Lv19-23 の総括]**: 分散は原子性/可用性/可読性のどれかを必ず別の場所で払う —— 2PC はブロッキング、saga は中間状態、
+  outbox は非同期、choreography は観測性で。タダのものは無い。選ぶのは「壁の位置」だけ(教訓38 の総括)。
+
+---
+
 ## メタな学び
 - **同じアプリを全段で使い回し、基盤だけ変える**と、数字がフェアに比較でき「何が効いたか」を切り分けられる。
 - **observability（`instance` 可視化・`/metrics`・k6）を最初の段から**入れると、後段の異常にすぐ気づける。

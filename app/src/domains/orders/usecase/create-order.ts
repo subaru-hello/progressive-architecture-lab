@@ -6,6 +6,11 @@ import type { ItemsPort } from '../../../ports/items-port.js';
 import type { OrdersRepoPort } from '../ports.js';
 import { assertPositiveQuantity, type Order } from '../domain/order.js';
 
+// Lv23: saga のスタイル。orchestration = 中央指揮者、choreography = イベント駆動分散。
+// Lv23: saga style. orchestration = central coordinator; choreography = event-driven distributed.
+export type SagaStyle = 'orchestration' | 'choreography';
+export const SAGA_STYLES: readonly SagaStyle[] = ['orchestration', 'choreography'];
+
 export class AuthError extends Error {
   readonly code = 'AUTH_ERROR';
   constructor() { super('unauthorized'); }
@@ -49,12 +54,15 @@ export interface CreateOrderDeps {
   // Lv19: port モードのみ有効。join モードでは無視。
   // Lv19: only active when mode='port'; ignored for mode='join'.
   txMode?: TxMode;
+  // Lv23: saga txMode 時のみ有効。orchestration = 既存動作、choreography = イベント駆動。
+  // Lv23: only meaningful when txMode='saga'. orchestration = existing; choreography = event-driven.
+  sagaStyle?: SagaStyle;
   fault?: FaultOpts;
 }
 
 export async function createOrder(cmd: CreateOrderCmd, deps: CreateOrderDeps): Promise<Order> {
   const { token, itemId, qty } = cmd;
-  const { usersPort, itemsPort, ordersRepo, mode, txMode = 'none', fault } = deps;
+  const { usersPort, itemsPort, ordersRepo, mode, txMode = 'none', sagaStyle = 'orchestration', fault } = deps;
 
   // (0) ドメイン不変条件: qty は正の整数（routes でも検証済だが usecase 単体でも守る=defense in depth）。
   // (0) Domain invariant: qty must be a positive integer (routes validate too; usecase self-guards).
@@ -83,6 +91,9 @@ export async function createOrder(cmd: CreateOrderCmd, deps: CreateOrderDeps): P
       return createOrder2pc(cmd, { itemsPort, ordersRepo, userId: user.id, fault });
 
     case 'saga':
+      if (sagaStyle === 'choreography') {
+        return createOrderChoreography(cmd, { ordersRepo, userId: user.id });
+      }
       return createOrderSaga(cmd, { itemsPort, ordersRepo, userId: user.id, fault });
 
     case 'outbox':
@@ -241,4 +252,21 @@ async function createOrderOutbox(
 
   const msgId = `msg-${randomUUID()}`;
   return ordersRepo.insertOrderWithOutbox(msgId, { userId, itemId, qty });
+}
+
+// ── choreography saga ─────────────────────────────────────────────────────────
+// Lv23 コレオグラフィ saga: orders は OrderCreated イベントを choreo_outbox に書くだけ。
+// items-service が反応し StockReserved/StockRejected を emit → orders が confirm/cancel。
+// Lv23 choreography saga: orders writes an OrderCreated event to choreo_outbox and returns
+// a 'pending' order immediately. items-service reacts and emits StockReserved/StockRejected;
+// orders then confirms or cancels via its /internal/choreo/events endpoint.
+async function createOrderChoreography(
+  cmd: CreateOrderCmd,
+  deps: { ordersRepo: OrdersRepoPort; userId: number },
+): Promise<Order> {
+  const { itemId, qty } = cmd;
+  const { ordersRepo, userId } = deps;
+
+  const msgId = `choreo-${randomUUID()}`;
+  return ordersRepo.insertPendingOrderWithEvent(msgId, { userId, itemId, qty });
 }

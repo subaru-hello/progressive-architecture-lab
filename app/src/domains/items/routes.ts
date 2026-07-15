@@ -258,6 +258,25 @@ export async function itemsRoutes(app: FastifyInstance, opts: ItemsPluginOptions
     return result;
   });
 
+  // Lv23 choreography saga: OrderCreated イベント受信エンドポイント (冪等)。
+  // Lv23 choreography: receive OrderCreated event; idempotent via processed_messages.
+  // Lv23 choreography: items が consume するのは OrderCreated。orders 側の受信 endpoint とパスを分ける
+  // (SERVICE=all では両ドメインが同一 Fastify インスタンスに載るので同名だと FST_ERR_DUPLICATED_ROUTE)。
+  app.post('/internal/choreo/order-events', async (req, reply) => {
+    const body = req.body as { msgId?: string; eventType?: string; payload?: { orderId?: number; itemId?: number; qty?: number } };
+    if (!body?.msgId || body.eventType !== 'OrderCreated' || body.payload?.orderId == null || body.payload?.itemId == null || body.payload?.qty == null) {
+      reply.code(400);
+      return { error: 'msgId, eventType=OrderCreated, payload.{orderId,itemId,qty} are required' };
+    }
+    await itemsRepo.handleOrderCreatedIdempotent(
+      body.msgId,
+      Number(body.payload.orderId),
+      Number(body.payload.itemId),
+      Number(body.payload.qty),
+    );
+    return { ok: true };
+  });
+
   // Lv18 バックフィル用: 全 item 取得（LIMIT なし）。ストラングラーフィグ移行時のソース DB 読み取り。
   // Lv18 backfill: fetch ALL items (no LIMIT) — read source-of-truth during strangler-fig migration.
   app.get('/internal/items/all', async () => {

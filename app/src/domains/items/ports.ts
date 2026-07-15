@@ -40,4 +40,27 @@ export interface ItemsRepoPort {
   // Lv22 outbox: 冪等 decrement。ON CONFLICT DO NOTHING で重複 msg_id を検出。
   // Lv22 outbox: idempotent decrement — duplicate msg_id detected via ON CONFLICT DO NOTHING.
   applyDecrementIdempotent(msgId: string, itemId: number, qty: number): Promise<{ applied: boolean; duplicate: boolean }>;
+
+  // Lv23 choreography saga: choreo_outbox テーブルを items-db に作成。
+  // Lv23 choreography: create choreo_outbox table on items-db.
+  initChoreoSchema(): Promise<void>;
+
+  // Lv23 choreography saga: OrderCreated イベントを冪等に処理。
+  // 在庫予約成功なら StockReserved、失敗なら StockRejected を choreo_outbox に書く。
+  // Lv23 choreography: idempotent OrderCreated handler.
+  // On success: emit StockReserved; on failure: emit StockRejected — both in a single tx.
+  handleOrderCreatedIdempotent(
+    msgId: string,
+    orderId: number,
+    itemId: number,
+    qty: number,
+  ): Promise<{ result: 'reserved' | 'rejected' }>;
+
+  // Lv23 choreography saga: 未配送の items choreo_outbox 行を取得。
+  // Lv23 choreography: fetch undelivered items choreo_outbox rows.
+  claimUndeliveredChoreoOutbox(limit: number): Promise<{ msg_id: string; event_type: string; payload: unknown }[]>;
+
+  // Lv23 choreography saga: items choreo_outbox 行を配送済みにマーク。
+  // Lv23 choreography: mark items choreo_outbox row as delivered.
+  markChoreoOutboxDelivered(msgId: string): Promise<void>;
 }

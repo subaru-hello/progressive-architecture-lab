@@ -62,8 +62,14 @@ export class PgOrdersRepo implements OrdersRepoPort {
         user_id INT NOT NULL,
         item_id INT NOT NULL,
         qty INT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'confirmed',
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
+    `);
+    // 既存 DB への後方互換: status 列が無ければ追加する。
+    // Backward-compat for existing DBs: add status column if it doesn't exist.
+    await this.pool.query(`
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'confirmed';
     `);
   }
 
@@ -267,5 +273,112 @@ export class PgOrdersRepo implements OrdersRepoPort {
   // Lv22 outbox: mark the outbox row as delivered.
   async markOutboxDelivered(msgId: string): Promise<void> {
     await this.pool.query(`UPDATE outbox SET delivered_at = now() WHERE msg_id = $1`, [msgId]);
+  }
+
+  // Lv23 choreography saga: choreo_outbox テーブルを orders-db に作成。
+  // Lv23 choreography saga: create choreo_outbox table on orders-db.
+  async initChoreoSchema(): Promise<void> {
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS choreo_outbox (
+        msg_id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        payload JSONB NOT NULL,
+        delivered_at TIMESTAMPTZ
+      );
+    `);
+  }
+
+  // Lv23 choreography saga: orders-db に processed_messages テーブルを作成 (dedup 用)。
+  // Lv23 choreography: create processed_messages on orders-db for event dedup.
+  async initOrdersInboxSchema(): Promise<void> {
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS processed_messages (
+        msg_id TEXT PRIMARY KEY,
+        processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+  }
+
+  // Lv23 choreography saga: orders INSERT(status='pending') + choreo_outbox INSERT(OrderCreated) を単一 tx。
+  // Lv23 choreography: insert pending order + OrderCreated event in a single orders-db tx.
+  async insertPendingOrderWithEvent(
+    msgId: string,
+    args: { userId: number; itemId: number; qty: number },
+  ): Promise<Order> {
+    const c = await this.pool.connect();
+    try {
+      await c.query('BEGIN');
+      const { rows } = await c.query(
+        `INSERT INTO orders(user_id, item_id, qty, status) VALUES($1, $2, $3, 'pending')
+         RETURNING id, user_id, item_id, qty, status, created_at`,
+        [args.userId, args.itemId, args.qty],
+      );
+      const order: Order = rows[0];
+      const payload = JSON.stringify({ orderId: order.id, itemId: args.itemId, qty: args.qty });
+      await c.query(
+        `INSERT INTO choreo_outbox(msg_id, event_type, payload) VALUES($1, 'OrderCreated', $2)`,
+        [msgId, payload],
+      );
+      await c.query('COMMIT');
+      return order;
+    } catch (err) {
+      try { await c.query('ROLLBACK'); } catch { /* ignore cleanup error */ }
+      throw err;
+    } finally {
+      c.release();
+    }
+  }
+
+  // Lv23 choreography saga: 未配送の choreo_outbox 行を取得。
+  // Lv23 choreography: fetch undelivered choreo_outbox rows.
+  async claimUndeliveredChoreoOutbox(
+    limit: number,
+  ): Promise<{ msg_id: string; event_type: string; payload: unknown }[]> {
+    const { rows } = await this.pool.query(
+      `SELECT msg_id, event_type, payload FROM choreo_outbox WHERE delivered_at IS NULL ORDER BY msg_id LIMIT $1`,
+      [limit],
+    );
+    return rows;
+  }
+
+  // Lv23 choreography saga: choreo_outbox 行を配送済みにマーク。
+  // Lv23 choreography: mark choreo_outbox row as delivered.
+  async markChoreoOutboxDelivered(msgId: string): Promise<void> {
+    await this.pool.query(`UPDATE choreo_outbox SET delivered_at = now() WHERE msg_id = $1`, [msgId]);
+  }
+
+  // Lv23 choreography saga: StockReserved/StockRejected イベントを冪等に適用。
+  // 同一 orders-db tx で processed_messages INSERT ON CONFLICT + orders status 更新。
+  // Lv23 choreography: idempotent event application.
+  // Single orders-db tx: processed_messages INSERT ON CONFLICT + orders status update.
+  async applyOrderEventIdempotent(
+    msgId: string,
+    eventType: string,
+    payload: { orderId: number },
+  ): Promise<void> {
+    const c = await this.pool.connect();
+    try {
+      await c.query('BEGIN');
+      const ins = await c.query(
+        `INSERT INTO processed_messages(msg_id) VALUES($1) ON CONFLICT DO NOTHING`,
+        [msgId],
+      );
+      if (ins.rowCount !== 0) {
+        // 新規: status を更新する。
+        // New event: apply status transition.
+        const newStatus = eventType === 'StockReserved' ? 'confirmed' : 'cancelled';
+        await c.query(
+          `UPDATE orders SET status = $1 WHERE id = $2 AND status = 'pending'`,
+          [newStatus, payload.orderId],
+        );
+      }
+      // 既処理の場合は何もしない (no-op)。
+      await c.query('COMMIT');
+    } catch (err) {
+      try { await c.query('ROLLBACK'); } catch { /* ignore cleanup error */ }
+      throw err;
+    } finally {
+      c.release();
+    }
   }
 }

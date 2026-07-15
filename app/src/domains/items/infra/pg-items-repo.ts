@@ -342,4 +342,98 @@ export class PgItemsRepo implements ItemsRepoPort {
       c.release();
     }
   }
+
+  // Lv23 choreography saga: choreo_outbox テーブルを items-db に作成。
+  // Lv23 choreography: create choreo_outbox table on items-db.
+  async initChoreoSchema(): Promise<void> {
+    await this.writePool.query(`
+      CREATE TABLE IF NOT EXISTS choreo_outbox (
+        msg_id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        payload JSONB NOT NULL,
+        delivered_at TIMESTAMPTZ
+      );
+    `);
+  }
+
+  // Lv23 choreography saga: OrderCreated イベントを冪等に処理 (単一 items-db tx)。
+  // 在庫充足 → stock デクリメント + StockReserved emit。
+  // 在庫不足 → stock 変更なし + StockRejected emit。
+  // Lv23 choreography: idempotent OrderCreated handler in a single items-db tx.
+  // Sufficient stock → decrement + emit StockReserved.
+  // Insufficient stock → no change + emit StockRejected.
+  async handleOrderCreatedIdempotent(
+    msgId: string,
+    orderId: number,
+    itemId: number,
+    qty: number,
+  ): Promise<{ result: 'reserved' | 'rejected' }> {
+    const c = await this.writePool.connect();
+    try {
+      await c.query('BEGIN');
+      // dedup チェック: 既処理なら no-op で返す。
+      // Dedup: if already processed, no-op.
+      const ins = await c.query(
+        `INSERT INTO processed_messages(msg_id) VALUES($1) ON CONFLICT DO NOTHING`,
+        [msgId],
+      );
+      if (ins.rowCount === 0) {
+        await c.query('COMMIT');
+        // 既処理なら以前の結果を返す必要があるが、呼び出し元は 200 を返せばよい。
+        // Already processed; caller only needs idempotent 200. Return a stable value.
+        return { result: 'reserved' };
+      }
+      // 在庫チェック + デクリメント (atomic)。
+      // Atomic stock check + decrement.
+      const dec = await c.query(
+        `UPDATE items SET stock = stock - $2 WHERE id = $1 AND stock >= $2 RETURNING stock`,
+        [itemId, qty],
+      );
+      let result: 'reserved' | 'rejected';
+      if (dec.rows.length > 0) {
+        // 予約成功: StockReserved を emit。
+        // Reservation succeeded: emit StockReserved.
+        const replyMsgId = `choreo-reply-${msgId}`;
+        await c.query(
+          `INSERT INTO choreo_outbox(msg_id, event_type, payload) VALUES($1, 'StockReserved', $2)`,
+          [replyMsgId, JSON.stringify({ orderId })],
+        );
+        result = 'reserved';
+      } else {
+        // 在庫不足: StockRejected を emit。
+        // Insufficient stock: emit StockRejected.
+        const replyMsgId = `choreo-reply-${msgId}`;
+        await c.query(
+          `INSERT INTO choreo_outbox(msg_id, event_type, payload) VALUES($1, 'StockRejected', $2)`,
+          [replyMsgId, JSON.stringify({ orderId, reason: 'insufficient stock' })],
+        );
+        result = 'rejected';
+      }
+      await c.query('COMMIT');
+      return { result };
+    } catch (err) {
+      try { await c.query('ROLLBACK'); } catch { /* ignore cleanup error */ }
+      throw err;
+    } finally {
+      c.release();
+    }
+  }
+
+  // Lv23 choreography saga: 未配送の items choreo_outbox 行を取得。
+  // Lv23 choreography: fetch undelivered items choreo_outbox rows.
+  async claimUndeliveredChoreoOutbox(
+    limit: number,
+  ): Promise<{ msg_id: string; event_type: string; payload: unknown }[]> {
+    const { rows } = await this.writePool.query(
+      `SELECT msg_id, event_type, payload FROM choreo_outbox WHERE delivered_at IS NULL ORDER BY msg_id LIMIT $1`,
+      [limit],
+    );
+    return rows;
+  }
+
+  // Lv23 choreography saga: items choreo_outbox 行を配送済みにマーク。
+  // Lv23 choreography: mark items choreo_outbox row as delivered.
+  async markChoreoOutboxDelivered(msgId: string): Promise<void> {
+    await this.writePool.query(`UPDATE choreo_outbox SET delivered_at = now() WHERE msg_id = $1`, [msgId]);
+  }
 }

@@ -36,3 +36,4 @@
 - [Lv20 — 実ネットワークの税（k3d 化）：往復差は「平均」でなく「裾」に出る（dataplane floor は全モード一律・2PC はテールで壊れる）](20-lv20.md)
 - [Lv21 — 2PC 自動 crash-recovery：in-doubt は「決定を永続化」して「起動時に再解決」すれば消える（commit point + リゾルバ + presumed-abort）](21-lv21.md)
 - [Lv22 — transactional outbox（exactly-once）：exactly-once「配送」は無い。効果＝ at-least-once ＋ 冪等消費者（原子性を分散txから単一DB tx+dedup へ）](22-lv22.md)
+- [Lv23 — choreography saga：制御を中央から散らすと結合は減るが「フローがどこにも無い」観測性の税（orchestration↔choreography=制御の所在の取引）](23-lv23.md)

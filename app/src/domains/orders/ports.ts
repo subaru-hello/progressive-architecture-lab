@@ -53,4 +53,23 @@ export interface OrdersRepoPort {
   insertOrderWithOutbox(msgId: string, args: { userId: number; itemId: number; qty: number }): Promise<Order>;
   claimUndeliveredOutbox(limit: number): Promise<{ msg_id: string; order_id: number; item_id: number; qty: number }[]>;
   markOutboxDelivered(msgId: string): Promise<void>;
+
+  // Lv23 choreography saga: choreo_outbox スキーマ + 送受信メソッド。
+  // Lv23 choreography saga: choreo_outbox schema + send/receive methods.
+  initChoreoSchema(): Promise<void>;
+  // orders insert(status='pending') + choreo_outbox insert(OrderCreated) を単一 tx で実行。
+  // Insert pending order + OrderCreated event in a single orders-db tx.
+  insertPendingOrderWithEvent(msgId: string, args: { userId: number; itemId: number; qty: number }): Promise<Order>;
+  // 未配送の choreo_outbox 行を取得。
+  // Fetch undelivered choreo_outbox rows.
+  claimUndeliveredChoreoOutbox(limit: number): Promise<{ msg_id: string; event_type: string; payload: unknown }[]>;
+  // choreo_outbox 行を配送済みにマーク。
+  // Mark choreo_outbox row as delivered.
+  markChoreoOutboxDelivered(msgId: string): Promise<void>;
+  // processed_messages + orders status 更新を単一 orders-db tx で実行 (冪等)。
+  // Apply StockReserved/StockRejected event: dedup + status update in a single orders-db tx.
+  applyOrderEventIdempotent(msgId: string, eventType: string, payload: { orderId: number }): Promise<void>;
+  // orders-db の processed_messages スキーマ (choreography 用)。
+  // orders-db processed_messages schema (for choreography dedup).
+  initOrdersInboxSchema(): Promise<void>;
 }

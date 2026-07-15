@@ -4,7 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import type { UsersPort } from '../../ports/users-port.js';
 import type { ItemsPort } from '../../ports/items-port.js';
 import type { OrdersRepoPort } from './ports.js';
-import { createOrder, AuthError, StockError, type TxMode, type FaultOpts } from './usecase/create-order.js';
+import { createOrder, AuthError, StockError, type TxMode, type SagaStyle, type FaultOpts } from './usecase/create-order.js';
 import { listOrders } from './usecase/list-orders.js';
 
 export interface OrdersPluginOptions {
@@ -16,11 +16,38 @@ export interface OrdersPluginOptions {
   // Lv19: port モードのみ有効。未設定時は 'none' = 既存動作。
   // Lv19: only active in port mode; defaults to 'none' = existing behavior.
   txMode?: TxMode;
+  // Lv23: saga txMode 時のみ有効。未設定時は 'orchestration' = 既存動作。
+  // Lv23: only meaningful when txMode='saga'; defaults to 'orchestration' = existing behavior.
+  sagaStyle?: SagaStyle;
   fault?: FaultOpts;
 }
 
 export async function ordersRoutes(app: FastifyInstance, opts: OrdersPluginOptions): Promise<void> {
-  const { ordersRepo, usersPort, itemsPort, mode, INSTANCE, txMode = 'none', fault } = opts;
+  const { ordersRepo, usersPort, itemsPort, mode, INSTANCE, txMode = 'none', sagaStyle = 'orchestration', fault } = opts;
+
+  // Lv23 choreography saga: StockReserved/StockRejected イベント受信エンドポイント (冪等)。
+  // Lv23 choreography: receive StockReserved/StockRejected; idempotent via processed_messages.
+  // Lv23 choreography: orders が consume するのは StockReserved/StockRejected。items 側の受信 endpoint と
+  // パスを分ける (SERVICE=all で同一インスタンスに両ドメインが載るため同名だと重複登録でクラッシュ)。
+  app.post('/internal/choreo/stock-events', async (req, reply) => {
+    const body = req.body as { msgId?: string; eventType?: string; payload?: { orderId?: number } };
+    if (!body?.msgId || !body.eventType || body.payload?.orderId == null) {
+      reply.code(400);
+      return { error: 'msgId, eventType, and payload.orderId are required' };
+    }
+    if (body.eventType !== 'StockReserved' && body.eventType !== 'StockRejected') {
+      reply.code(400);
+      return { error: 'eventType must be StockReserved or StockRejected' };
+    }
+    try {
+      await ordersRepo.applyOrderEventIdempotent(body.msgId, body.eventType, { orderId: Number(body.payload.orderId) });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      reply.code(500);
+      return { error: `applyOrderEventIdempotent failed: ${msg}` };
+    }
+    return { ok: true };
+  });
 
   app.post('/orders', async (req, reply) => {
     const token = req.headers['x-auth-token'] as string | undefined;
@@ -41,7 +68,7 @@ export async function ordersRoutes(app: FastifyInstance, opts: OrdersPluginOptio
     try {
       const order = await createOrder(
         { token, itemId, qty },
-        { usersPort, itemsPort, ordersRepo, mode, txMode, fault },
+        { usersPort, itemsPort, ordersRepo, mode, txMode, sagaStyle, fault },
       );
       reply.code(201);
       return { instance: INSTANCE, order };
