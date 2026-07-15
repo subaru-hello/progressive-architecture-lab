@@ -15,6 +15,10 @@ export interface ItemsPort {
   commitTx(gid: string): Promise<void>;
   rollbackTx(gid: string): Promise<void>;
 
+  // Lv21 2PC リゾルバ: items-db の prepared gid 一覧。
+  // Lv21 2PC resolver: list prepared gids on items-db (for coordinator crash recovery).
+  listPreparedTx(): Promise<string[]>;
+
   // Lv19 saga: 冪等 reserve / release。
   // Lv19 saga: idempotent reserve / release (HTTP calls to /internal/reserve|release).
   reserveStock(gid: string, itemId: number, qty: number): Promise<{ ok: boolean; stock: number }>;
@@ -46,6 +50,12 @@ export class InProcessItemsAdapter implements ItemsPort {
 
   rollbackTx(gid: string): Promise<void> {
     return this.itemsRepo.rollbackPrepared(gid);
+  }
+
+  // Lv21 2PC リゾルバ: インプロセスはリポジトリに直接委譲。
+  // Lv21 2PC resolver: in-process delegates directly to the repo.
+  listPreparedTx(): Promise<string[]> {
+    return this.itemsRepo.listPreparedGids();
   }
 
   // Lv19 saga: インプロセスはリポジトリに直接委譲。
@@ -153,6 +163,14 @@ export class DualWriteItemsAdapter implements ItemsPort {
     return this.mode === 'secondary_only'
       ? this.secondary.rollbackTx(gid)
       : this.primary.rollbackTx(gid);
+  }
+
+  // Lv21 2PC リゾルバ: モードに応じてプライマリかセカンダリに委譲。
+  // Lv21 2PC resolver: delegate to primary or secondary based on mode.
+  listPreparedTx(): Promise<string[]> {
+    return this.mode === 'secondary_only'
+      ? this.secondary.listPreparedTx()
+      : this.primary.listPreparedTx();
   }
 
   reserveStock(gid: string, itemId: number, qty: number): Promise<{ ok: boolean; stock: number }> {
@@ -274,6 +292,17 @@ export class HttpItemsAdapter implements ItemsPort {
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) throw new Error(`items service rollbackTx failed: ${res.status}`);
+  }
+
+  // Lv21 2PC リゾルバ: items-service の /internal/tx/prepared を呼ぶ。
+  // Lv21 2PC resolver: call items-service GET /internal/tx/prepared.
+  async listPreparedTx(): Promise<string[]> {
+    const res = await fetch(`${this.baseUrl}/internal/tx/prepared`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error(`items service listPreparedTx failed: ${res.status}`);
+    const data = await res.json() as { gids: string[] };
+    return data.gids;
   }
 
   // Lv19 saga: items-service の /internal/reserve を呼ぶ。

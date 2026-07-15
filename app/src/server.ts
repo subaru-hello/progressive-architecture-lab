@@ -293,6 +293,14 @@ app.get('/', async () => ({
 // --- ドメインルートの登録 ---
 // --- Domain route registration ---
 
+// Lv21 2PC 起動時リゾルバの thunk。composition root(loadOrders ブロック)で ordersRepo/itemsPort を
+// クローズオーバーして格納し、main() が initDb() 完了後・listen 前に await 実行する。
+// fire-and-forget にすると tx_journal 作成(initDb)とレースし初回起動でサイレント no-op になるため。
+// Lv21 2PC startup-resolver thunk: captured in the composition root (loadOrders block) closing over
+// ordersRepo/itemsPort; main() awaits it AFTER initDb() and BEFORE listen. Launching fire-and-forget
+// would race tx_journal creation (initDb) and silently no-op recovery on first boot.
+let run2pcResolver: (() => Promise<void>) | null = null;
+
 if (ARCH === 'mud') {
   // mud モード: mud ルートだけを登録。ヘックス版ドメインは一切ロードしない。
   // mud mode: register only mud routes; hex domain code is never loaded.
@@ -435,7 +443,76 @@ if (ARCH === 'mud') {
         }
       }, 2000);
     }
+
+    // Lv21 2PC 起動時リゾルバ: 2pc モード + orders ロード時のみ。ここでは thunk を格納するだけで、
+    // 実行は main() が initDb()(tx_journal 作成)完了後・listen 前に await する(schema レース回避 +
+    // 将来 coordinator を多重化しても live traffic の in-flight 2pc とレースしない)。
+    // Lv21 2PC startup resolver: only in 2pc mode with orders loaded. Store the thunk here; main()
+    // awaits it AFTER initDb() (tx_journal created) and BEFORE listen (avoids the schema race and,
+    // if the coordinator is ever replicated, the live-traffic in-flight-2pc race).
+    if (ORDER_TX_MODE === '2pc') {
+      const resolverOrdersRepo = ordersRepo;
+      const resolverItemsPort = itemsPort;
+      run2pcResolver = () => resolveInDoubt(resolverOrdersRepo, resolverItemsPort, app.log);
+    }
   }
+}
+
+// Lv21 2PC 起動時リゾルバ: インダウト prepared xact を決定ジャーナルに基づいて自動解決。
+// Lv21 2PC startup resolver: auto-resolve in-doubt prepared txns using the decision journal.
+//
+// correctness の核心: items 未達なら deleteJournal しない (deferred)。
+// ジャーナルを先に消すと次回起動で「決定なし→abort」と誤判定し orders(commit済) と items(rollback)
+// が食い違う。items が到達可能になった次回起動で再度解決する。
+// Correctness core: do NOT deleteJournal when items is unreachable (deferred).
+// Deleting the journal early would cause the next boot to misread "no decision → abort", leaving
+// orders committed and items rolled back — a split-brain. Defer until both sides are confirmed.
+async function resolveInDoubt(
+  ordersRepo: import('./domains/orders/infra/pg-orders-repo.js').PgOrdersRepo,
+  itemsPort: import('./ports/items-port.js').InProcessItemsAdapter | import('./ports/items-port.js').DualWriteItemsAdapter,
+  log: import('fastify').FastifyBaseLogger,
+): Promise<void> {
+  const localPrepared = new Set(await ordersRepo.listPreparedGids());
+  let itemsReachable = true;
+  let itemsPrepared = new Set<string>();
+  try {
+    itemsPrepared = new Set(await itemsPort.listPreparedTx());
+  } catch (e) {
+    itemsReachable = false;
+    log.warn({ err: e }, 'resolver: items unreachable; orders-side only this pass');
+  }
+  const commits = new Set(await ordersRepo.listJournalCommits());
+  const all = new Set([...localPrepared, ...itemsPrepared, ...commits]);
+  let committed = 0, aborted = 0, deferred = 0;
+  for (const gid of all) {
+    try {
+      if (commits.has(gid)) {
+        // 決定=COMMIT → 両者を commit (冪等)。
+        // Decision=COMMIT → commit both sides (idempotent).
+        if (localPrepared.has(gid)) await ordersRepo.commitPrepared(gid);
+        if (itemsReachable) {
+          if (itemsPrepared.has(gid)) await itemsPort.commitTx(gid);
+          // 両者 done を確認できた時だけジャーナルを消す。
+          // Delete journal only after confirming both sides are done.
+          await ordersRepo.deleteJournal(gid);
+          committed++;
+        } else {
+          // items 未達 → ジャーナルを残し次回起動へ持ち越す。
+          // items unreachable → keep journal; defer to next boot.
+          deferred++;
+        }
+      } else {
+        // 決定なし → ABORT (両者 rollback・冪等)。ジャーナル行は無いので消す物なし。
+        // No decision → ABORT (rollback both, idempotent). No journal row to delete.
+        if (localPrepared.has(gid)) await ordersRepo.rollbackPrepared(gid);
+        if (itemsReachable && itemsPrepared.has(gid)) await itemsPort.rollbackTx(gid);
+        aborted++;
+      }
+    } catch (e) {
+      log.warn({ gid, err: e }, 'resolver: failed to resolve gid, will retry next restart');
+    }
+  }
+  log.info({ committed, aborted, deferred, scanned: all.size }, '2pc resolver done');
 }
 
 // initDb は ARCH ごとに異なるスキーマを初期化する。
@@ -475,6 +552,9 @@ async function initDb(): Promise<void> {
     // Lv19 saga: saga_log is owned by the orders domain.
     // Create whenever orders is loaded, regardless of ORDER_TX_MODE — decouple from coordinator config.
     await repo.initSagaSchema();
+    // Lv21 2PC 決定ジャーナル: saga_log と同様に常に作成 (MODE 非依存)。
+    // Lv21 2PC decision journal: always create alongside saga_log (mode-independent).
+    await repo.initTxJournalSchema();
   }
   if (loadItems) {
     // Lv19 saga: reservations は items ドメインが所有するテーブル。
@@ -538,6 +618,18 @@ async function main(): Promise<void> {
       if (attempt >= 30) throw new Error('items table not visible on readPool after 30 attempts');
       app.log.warn(`readPool: waiting for items to replicate (attempt ${attempt}/30)...`);
       await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+
+  // Lv21 2PC 起動時リゾルバを serve 前に await 完走させる。initDb() 済(tx_journal あり)なので
+  // schema レースが無く、listen 前なので live traffic の in-flight 2pc とも競合しない。
+  // Run the 2PC startup resolver to completion BEFORE serving: initDb() has created tx_journal
+  // (no schema race) and listen hasn't started (no live-traffic race).
+  if (run2pcResolver) {
+    try {
+      await run2pcResolver();
+    } catch (err) {
+      app.log.warn({ err }, '2pc resolver: unexpected error');
     }
   }
 

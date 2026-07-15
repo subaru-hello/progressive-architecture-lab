@@ -20,6 +20,10 @@ export interface ItemsRepoPort {
   commitPrepared(gid: string): Promise<void>;
   rollbackPrepared(gid: string): Promise<void>;
 
+  // Lv21 2PC リゾルバ: items-db の prepared transaction 一覧 (gid LIKE 'ord-%')。
+  // Lv21 2PC resolver: list prepared transactions on items-db (gid LIKE 'ord-%').
+  listPreparedGids(): Promise<string[]>;
+
   // Lv19 saga: 冪等 reserve / release。
   // Lv19 saga: idempotent reserve / release using reservations table.
   reserve(gid: string, id: number, qty: number): Promise<{ ok: boolean; stock: number }>;

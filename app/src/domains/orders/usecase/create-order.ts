@@ -144,17 +144,33 @@ async function createOrder2pc(
   }
 
   // FAULT POINT: after-prepare-all — 両 DB に prepared tx が残った状態で意図的に throw。
+  // ジャーナル書込の前 → recovery は ABORT する系列 (Lv19 互換)。
   // FAULT POINT: after-prepare-all — deliberately throw with both DBs holding prepared txns.
-  // これによりロックを保持したインダウト状態をデモできる。
-  // Demonstrates in-doubt transactions holding row locks on both DBs.
+  // Placed BEFORE journal write → recovery will ABORT (maintains Lv19 semantics).
   if (fault?.faultPoint === 'after-prepare-all') {
     throw new Error('[fault] after-prepare-all: both prepared txns orphaned (in-doubt demo)');
+  }
+
+  // COMMIT POINT: 決定を永続化してから Phase 2 に進む。
+  // COMMIT POINT: persist the commit decision before entering Phase 2.
+  await ordersRepo.writeJournalCommit(gid);
+
+  // FAULT POINT: after-journal — ジャーナル書込後・commit 前に throw。
+  // recovery は COMMIT する系列 (Lv21 自動回復デモ)。
+  // FAULT POINT: after-journal — throw after journal write, before commit.
+  // recovery will COMMIT (Lv21 auto-recovery demo).
+  if (fault?.faultPoint === 'after-journal') {
+    throw new Error('[fault] after-journal: journaled commit decision but crash before committing');
   }
 
   // Phase 2: 両方をコミット。
   // Phase 2: commit both prepared transactions.
   await itemsPort.commitTx(gid);
   await ordersRepo.commitPrepared(gid);
+
+  // ジャーナル行を掃除 (best-effort)。recovery は冪等なので消し損ねても安全。
+  // Clean up journal row (best-effort). Recovery is idempotent so a missed delete is safe.
+  await ordersRepo.deleteJournal(gid);
 
   return order;
 }

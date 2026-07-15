@@ -31,6 +31,14 @@ export interface OrdersRepoPort {
   commitPrepared(gid: string): Promise<void>;
   rollbackPrepared(gid: string): Promise<void>;
 
+  // Lv21 2PC 決定ジャーナル: crash recovery 用のコミット決定永続化。
+  // Lv21 2PC decision journal: persist commit decision for crash recovery.
+  initTxJournalSchema(): Promise<void>;
+  writeJournalCommit(gid: string): Promise<void>;
+  deleteJournal(gid: string): Promise<void>;
+  listJournalCommits(): Promise<string[]>;
+  listPreparedGids(): Promise<string[]>;
+
   // Lv19 saga: saga_log 操作。
   // Lv19 saga: saga_log CRUD operations.
   insertSagaLog(args: { gid: string; userId: number; itemId: number; qty: number }): Promise<void>;

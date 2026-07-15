@@ -34,3 +34,4 @@
 - [Lv18 — ダウンタイムゼロ抽出（strangler-fig）：hex を live で移す（規律=0% / naive=66.7% / 泥団子=100% ダウン）](18-lv18.md)
 - [Lv19 — 分散トランザクション（none/2PC/saga）：タダの分散tx は無い（2PC=原子性↔ブロッキング / saga=可用性↔中間状態）](19-lv19.md)
 - [Lv20 — 実ネットワークの税（k3d 化）：往復差は「平均」でなく「裾」に出る（dataplane floor は全モード一律・2PC はテールで壊れる）](20-lv20.md)
+- [Lv21 — 2PC 自動 crash-recovery：in-doubt は「決定を永続化」して「起動時に再解決」すれば消える（commit point + リゾルバ + presumed-abort）](21-lv21.md)

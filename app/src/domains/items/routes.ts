@@ -199,6 +199,19 @@ export async function itemsRoutes(app: FastifyInstance, opts: ItemsPluginOptions
     return { ok: true };
   });
 
+  // Lv21 2PC リゾルバ: items-db の prepared gid 一覧を返す (coordinator の crash recovery 用)。
+  // Lv21 2PC resolver: list prepared gids on items-db (for coordinator crash recovery).
+  app.get('/internal/tx/prepared', async (_req, reply) => {
+    try {
+      const gids = await itemsRepo.listPreparedGids();
+      return { gids };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      reply.code(500);
+      return { error: `listPreparedGids failed: ${msg}` };
+    }
+  });
+
   // Lv19 saga: 冪等 reserve。
   // Lv19 saga: idempotent stock reservation.
   app.post('/internal/reserve', async (req, reply) => {

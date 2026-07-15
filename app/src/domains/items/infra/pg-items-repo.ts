@@ -195,6 +195,15 @@ export class PgItemsRepo implements ItemsRepoPort {
     }
   }
 
+  // Lv21 2PC リゾルバ: items-db の prepared transaction 一覧 (gid LIKE 'ord-%')。
+  // Lv21 2PC resolver: list prepared transactions on items-db (gid LIKE 'ord-%').
+  async listPreparedGids(): Promise<string[]> {
+    const { rows } = await this.writePool.query<{ gid: string }>(
+      `SELECT gid FROM pg_prepared_xacts WHERE gid LIKE 'ord-%'`,
+    );
+    return rows.map((r) => r.gid);
+  }
+
   // Lv19 saga: reservations テーブルを利用した冪等 reserve。
   // gid が既に reservations に存在 → 以前の結果を返す (idempotent replay)。
   // なければ stock -= qty を試み、成功なら reservations に INSERT。

@@ -130,6 +130,51 @@ export class PgOrdersRepo implements OrdersRepoPort {
     }
   }
 
+  // Lv21 2PC 決定ジャーナル: tx_journal テーブルを作成。
+  // Lv21 2PC decision journal: create tx_journal table.
+  async initTxJournalSchema(): Promise<void> {
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS tx_journal (
+        gid TEXT PRIMARY KEY,
+        decision TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+  }
+
+  // Lv21 2PC: コミット決定を永続化。冪等 (ON CONFLICT DO NOTHING)。
+  // Lv21 2PC: persist commit decision. Idempotent (ON CONFLICT DO NOTHING).
+  async writeJournalCommit(gid: string): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO tx_journal(gid, decision) VALUES($1, 'commit') ON CONFLICT (gid) DO NOTHING`,
+      [gid],
+    );
+  }
+
+  // Lv21 2PC: 両者が commit 完了した後にジャーナル行を削除 (best-effort)。
+  // Lv21 2PC: delete journal row after both sides confirmed committed (best-effort).
+  async deleteJournal(gid: string): Promise<void> {
+    await this.pool.query(`DELETE FROM tx_journal WHERE gid = $1`, [gid]);
+  }
+
+  // Lv21 2PC リゾルバ: decision='commit' の gid 一覧を返す。
+  // Lv21 2PC resolver: return gids with decision='commit'.
+  async listJournalCommits(): Promise<string[]> {
+    const { rows } = await this.pool.query<{ gid: string }>(
+      `SELECT gid FROM tx_journal WHERE decision = 'commit'`,
+    );
+    return rows.map((r) => r.gid);
+  }
+
+  // Lv21 2PC リゾルバ: orders-db の prepared transaction 一覧を返す (gid LIKE 'ord-%')。
+  // Lv21 2PC resolver: list prepared transactions on orders-db (gid LIKE 'ord-%').
+  async listPreparedGids(): Promise<string[]> {
+    const { rows } = await this.pool.query<{ gid: string }>(
+      `SELECT gid FROM pg_prepared_xacts WHERE gid LIKE 'ord-%'`,
+    );
+    return rows.map((r) => r.gid);
+  }
+
   // Lv19 saga: saga_log に初期行を挿入 (state='reserved')。
   // Lv19 saga: insert initial saga_log row with state='reserved'.
   async insertSagaLog(args: { gid: string; userId: number; itemId: number; qty: number }): Promise<void> {

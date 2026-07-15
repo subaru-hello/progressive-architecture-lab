@@ -1,0 +1,78 @@
+# Lv21 — 2PC の自動 crash-recovery。Lv19 の 2pc で coordinator が commit/rollback 間に死ぬと
+#   prepared xact が in-doubt で残り「手動 ROLLBACK PREPARED」が要った。Lv21 は coordinator に
+#   決定ジャーナル(tx_journal・commit point)+起動時リゾルバを入れ、再起動で宙吊りを自動再解決する。
+#
+#   api(coordinator: orders+users, DB=db) --HTTP--> items-service(SERVICE=items, DB=items-db)
+#   両 Postgres に max_prepared_transactions>0。tx_journal は orders-db(db)側に載る。
+#
+# 使い方（crash-recovery のデモ = api を作り直す＝プロセス再起動＝起動時リゾルバが走る）:
+#   起動:          docker compose -f stages/21-2pc-recovery/docker-compose.yml up --build -d
+#
+#   ① COMMIT 側リカバリ（ジャーナル書込後に死ぬ → 再起動で自動 commit）:
+#     FAULT_POINT=after-journal docker compose -f stages/21-2pc-recovery/docker-compose.yml up -d --no-deps api
+#     curl -s -X POST localhost:3021/orders -H 'x-auth-token: demo-token-1' -H 'content-type: application/json' -d '{"itemId":3,"qty":1}'   # → 500・両DBに prepared・journal=commit
+#     FAULT_POINT= docker compose -f stages/21-2pc-recovery/docker-compose.yml up -d --no-deps api                                          # api 再作成＝リゾルバが走る
+#     # → prepared xacts=0 / order 行あり / journal 空。手動 ROLLBACK PREPARED 不要。
+#
+#   ② ABORT 側リカバリ（ジャーナル書込前に死ぬ → 再起動で自動 rollback）:
+#     FAULT_POINT=after-prepare-all docker compose ... up -d --no-deps api
+#     curl ... /orders ...                 # → 500・両DBに prepared・journal 無し
+#     FAULT_POINT= docker compose ... up -d --no-deps api
+#     # → prepared xacts=0 / order 増えず / stock 復旧。
+#
+# in-doubt / journal 確認:
+#   docker compose ... exec db       psql -U pal -d pal -c "SELECT gid FROM pg_prepared_xacts;"
+#   docker compose ... exec items-db psql -U pal -d pal -c "SELECT gid FROM pg_prepared_xacts;"
+#   docker compose ... exec db       psql -U pal -d pal -c "SELECT gid,decision FROM tx_journal;"
+name: pal-lv21
+
+x-pg-2pc: &pg-2pc
+  image: postgres:16-alpine
+  command: ["postgres", "-c", "max_prepared_transactions=50"]
+  healthcheck: { test: ["CMD-SHELL", "pg_isready -U pal -d pal"], interval: 5s, timeout: 3s, retries: 10 }
+
+services:
+  db:                       # orders + users + tx_journal（coordinator 側 DB）
+    <<: *pg-2pc
+    environment: { POSTGRES_USER: pal, POSTGRES_PASSWORD: pal, POSTGRES_DB: pal }
+    volumes: [pgdata:/var/lib/postgresql/data]
+
+  items-db:                 # items 専用
+    <<: *pg-2pc
+    environment: { POSTGRES_USER: pal, POSTGRES_PASSWORD: pal, POSTGRES_DB: pal }
+    volumes: [items-pgdata:/var/lib/postgresql/data]
+
+  items-service:            # SERVICE=items（prepare/commit/rollback + /internal/tx/prepared を持つ参加者）
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@items-db:5432/pal
+      ARCH: hex
+      SERVICE: items
+      SEED_DEMO: "1"
+      PORT: "3000"
+    depends_on:
+      items-db: { condition: service_healthy }
+
+  api:                      # coordinator。既定で ORDER_TX_MODE=2pc。起動時リゾルバが in-doubt を再解決。
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      ARCH: hex
+      SERVICE: all
+      ORDERS_CROSS_CONTEXT: port
+      ITEMS_SERVICE_URL: http://items-service:3000
+      ITEMS_MIGRATION_MODE: secondary_only
+      ORDER_TX_MODE: ${ORDER_TX_MODE:-2pc}       # Lv21 の主役は 2pc
+      FAULT_POINT: ${FAULT_POINT:-}               # '' | after-prepare-all(abort系列) | after-journal(commit系列)
+      SEED_DEMO: "1"
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    ports:
+      - "3021:3000"    # host:3000 は他プロセスが使うことがあるため 3021 に退避
+    depends_on:
+      db: { condition: service_healthy }
+      items-service: { condition: service_started }
+
+volumes:
+  pgdata:
+  items-pgdata:

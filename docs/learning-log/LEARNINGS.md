@@ -313,6 +313,25 @@ items-service を **別ノードに配置**して在庫調停 HTTP を k8s datap
 
 ---
 
+## 40. ⭐ 2PC の in-doubt は「解けない」のでなく「決定を永続化し損ねている」 — commit point + 起動時リゾルバで自動回復する `[Lv21]`
+Lv19/Lv20 で踏んだ in-doubt(coordinator が両者 prepare 後・commit 前に死ぬと prepared txn が行ロックを握って宙吊り→
+**手動 `ROLLBACK PREPARED`**)を、古典的 2PC coordinator recovery で自動化:
+- **決定ジャーナル(commit point)**: coordinator DB に `tx_journal(gid,decision)`。両者 prepare 後に `decision='commit'` を
+  **永続化してから** commit を出す。この write が commit point(以降クラッシュしても必ず commit に前進)。**行あり=commit /
+  行なし=abort**(=**presumed-abort**: abort レコードは書かない古典的最適化)。
+- **起動時リゾルバ**: 再起動で一度だけ、`pg_prepared_xacts`(orders + items は HTTP)と journal を突合し、journal にあれば
+  両者 commit・無ければ両者 rollback(いずれも冪等)。**schema 初期化後・listen 前に await 完走**(fire-and-forget だと
+  tx_journal 作成とレースし初回サイレント no-op / 多重 coordinator では in-flight 2pc を誤 abort。qa 指摘で修正)。
+- **deferred-delete(核心)**: journal 行は「両者 commit 確認後だけ」削除。items 未達なら残し次回起動へ持ち越す。先に消すと
+  items prepared 残存時に次回「決定なし→abort」と誤判定し orders(commit済)と split-brain。
+- **実測**: after-journal 注入→再起動で `committed=1`(order 確定・stock 減) / after-prepare-all 注入→再起動で `aborted=1`
+  (rollback・stock 復旧)。**Lv19 の手動介入が再起動だけで自己回復**。
+- これは **XA トランザクションマネージャ/DB 内蔵 2PC coordinator が内部でやっていること**の手作り再現。教訓38 の続き ——
+  **2PC を実運用に耐えさせる税は「ミニ・トランザクションマネージャの自作と保守」**(coordinator がステートフル化し、
+  削除順序・deferred・serve 前実行という非自明な不変条件を守り続ける責任を負う)。
+
+---
+
 ## メタな学び
 - **同じアプリを全段で使い回し、基盤だけ変える**と、数字がフェアに比較でき「何が効いたか」を切り分けられる。
 - **observability（`instance` 可視化・`/metrics`・k6）を最初の段から**入れると、後段の異常にすぐ気づける。

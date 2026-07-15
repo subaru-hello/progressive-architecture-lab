@@ -35,8 +35,9 @@ Lv0 docker-compose      Lv1 compose + proxy       Lv2 k3s 単一ノード       
   naive移行は100%ダウン       層化は runtime 無料(4.85ms)  seam×手順の積・shadowで検証後cutover 2PC=原子性↔ブロッキング/saga=可用性↔中間状態
 
   ── さらに別軸：分散tx を本番グレードへ（実ネット税 → 2PC自動回復 → outbox → choreography）──
-  Lv20 実ネット税(k3d化)
-  往復差は「平均」でなく「裾」に出る：dataplane floor は全モード一律(~5x)・2PC はテールで壊れる(p95 1.38s)・in-doubt は基盤跨いでも再現
+  Lv20 実ネット税(k3d化)        →   Lv21 2PC自動crash-recovery
+  往復差は「平均」でなく「裾」に出る    in-doubt は決定ジャーナル(commit point)+起動時リゾルバで自動再解決
+  floor 一律(~5x)/2PC テールで壊れる  手動 ROLLBACK PREPARED が再起動で自己回復(presumed-abort/deferred-delete)
 ```
 
 各段は **同じ `app/`（Node/TS + Postgres API）** を使い回す。基盤だけが変わる。
