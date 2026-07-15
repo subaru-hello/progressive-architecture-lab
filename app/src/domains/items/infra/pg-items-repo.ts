@@ -295,4 +295,51 @@ export class PgItemsRepo implements ItemsRepoPort {
       );
     `);
   }
+
+  // Lv22 outbox: processed_messages テーブルを作成 (冪等 receiver 用)。
+  // Lv22 outbox: create processed_messages table (idempotent receiver inbox).
+  async initInboxSchema(): Promise<void> {
+    await this.writePool.query(`
+      CREATE TABLE IF NOT EXISTS processed_messages (
+        msg_id TEXT PRIMARY KEY,
+        processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+  }
+
+  // Lv22 outbox: 冪等 decrement。ON CONFLICT DO NOTHING で重複 msg_id を検出。
+  // 単一 tx: INSERT processed_messages → rowCount === 0 なら既処理 → 何もしない。
+  // Lv22 outbox: idempotent decrement in a single tx.
+  // INSERT processed_messages; rowCount=0 → duplicate → no-op; rowCount=1 → apply decrement.
+  async applyDecrementIdempotent(
+    msgId: string,
+    itemId: number,
+    qty: number,
+  ): Promise<{ applied: boolean; duplicate: boolean }> {
+    const c = await this.writePool.connect();
+    try {
+      await c.query('BEGIN');
+      const ins = await c.query(
+        `INSERT INTO processed_messages(msg_id) VALUES($1) ON CONFLICT DO NOTHING`,
+        [msgId],
+      );
+      if (ins.rowCount === 0) {
+        // 既処理 — 重複配送。何もしない。
+        // Already processed — duplicate delivery; no-op.
+        await c.query('COMMIT');
+        return { applied: false, duplicate: true };
+      }
+      await c.query(
+        'UPDATE items SET stock = stock - $2 WHERE id = $1',
+        [itemId, qty],
+      );
+      await c.query('COMMIT');
+      return { applied: true, duplicate: false };
+    } catch (err) {
+      try { await c.query('ROLLBACK'); } catch { /* ignore cleanup error */ }
+      throw err;
+    } finally {
+      c.release();
+    }
+  }
 }

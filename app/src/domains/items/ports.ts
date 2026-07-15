@@ -32,4 +32,12 @@ export interface ItemsRepoPort {
   // Lv19 スキーマ拡張フラグ: 2pc/saga 用テーブルが存在する場合のみ true。
   // Lv19 schema extension flag: create reservations table when saga mode is active.
   initSagaSchema(): Promise<void>;
+
+  // Lv22 outbox: processed_messages テーブルを作成 (冪等 receiver 用)。
+  // Lv22 outbox: create processed_messages table (idempotent receiver inbox).
+  initInboxSchema(): Promise<void>;
+
+  // Lv22 outbox: 冪等 decrement。ON CONFLICT DO NOTHING で重複 msg_id を検出。
+  // Lv22 outbox: idempotent decrement — duplicate msg_id detected via ON CONFLICT DO NOTHING.
+  applyDecrementIdempotent(msgId: string, itemId: number, qty: number): Promise<{ applied: boolean; duplicate: boolean }>;
 }

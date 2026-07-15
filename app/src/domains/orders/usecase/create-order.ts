@@ -26,10 +26,10 @@ export interface CreateOrderCmd {
   qty: number;
 }
 
-// Lv19: ORDER_TX_MODE の 3 値。
-// Lv19: three ORDER_TX_MODE values for cross-DB coordination strategy.
-export type TxMode = 'none' | '2pc' | 'saga';
-export const TX_MODES: readonly TxMode[] = ['none', '2pc', 'saga'];
+// Lv22: ORDER_TX_MODE の 4 値。
+// Lv22: four ORDER_TX_MODE values for cross-DB coordination strategy.
+export type TxMode = 'none' | '2pc' | 'saga' | 'outbox';
+export const TX_MODES: readonly TxMode[] = ['none', '2pc', 'saga', 'outbox'];
 
 // フォルトインジェクション設定。
 // Fault injection configuration.
@@ -84,6 +84,9 @@ export async function createOrder(cmd: CreateOrderCmd, deps: CreateOrderDeps): P
 
     case 'saga':
       return createOrderSaga(cmd, { itemsPort, ordersRepo, userId: user.id, fault });
+
+    case 'outbox':
+      return createOrderOutbox(cmd, { ordersRepo, userId: user.id });
   }
 }
 
@@ -222,4 +225,20 @@ async function createOrderSaga(
 
   await ordersRepo.updateSagaLogState(gid, 'completed');
   return order;
+}
+
+// ── outbox ────────────────────────────────────────────────────────────────────
+// Transactional outbox: orders insert + outbox insert を同一 orders-db tx で書く。
+// items への配送は非同期ポーラーが担当 — ここでは dual-write しない。
+// Transactional outbox: orders insert + outbox insert in a single orders-db tx.
+// Delivery to items is handled asynchronously by the outbox poller — no dual-write here.
+async function createOrderOutbox(
+  cmd: CreateOrderCmd,
+  deps: { ordersRepo: OrdersRepoPort; userId: number },
+): Promise<Order> {
+  const { itemId, qty } = cmd;
+  const { ordersRepo, userId } = deps;
+
+  const msgId = `msg-${randomUUID()}`;
+  return ordersRepo.insertOrderWithOutbox(msgId, { userId, itemId, qty });
 }

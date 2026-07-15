@@ -35,3 +35,4 @@
 - [Lv19 — 分散トランザクション（none/2PC/saga）：タダの分散tx は無い（2PC=原子性↔ブロッキング / saga=可用性↔中間状態）](19-lv19.md)
 - [Lv20 — 実ネットワークの税（k3d 化）：往復差は「平均」でなく「裾」に出る（dataplane floor は全モード一律・2PC はテールで壊れる）](20-lv20.md)
 - [Lv21 — 2PC 自動 crash-recovery：in-doubt は「決定を永続化」して「起動時に再解決」すれば消える（commit point + リゾルバ + presumed-abort）](21-lv21.md)
+- [Lv22 — transactional outbox（exactly-once）：exactly-once「配送」は無い。効果＝ at-least-once ＋ 冪等消費者（原子性を分散txから単一DB tx+dedup へ）](22-lv22.md)

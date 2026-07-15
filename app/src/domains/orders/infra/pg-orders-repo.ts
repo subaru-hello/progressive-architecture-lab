@@ -207,4 +207,65 @@ export class PgOrdersRepo implements OrdersRepoPort {
     );
     return rows;
   }
+
+  // Lv22 outbox スキーマ: outbox テーブルを作成。
+  // Lv22 outbox schema: create the outbox table on orders-db.
+  async initOutboxSchema(): Promise<void> {
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS outbox (
+        msg_id TEXT PRIMARY KEY,
+        order_id INT NOT NULL,
+        item_id INT NOT NULL,
+        qty INT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        delivered_at TIMESTAMPTZ
+      );
+    `);
+  }
+
+  // Lv22 outbox: orders insert + outbox insert を単一 tx で実行。
+  // Lv22 outbox: insert order and outbox row atomically in a single orders-db transaction.
+  async insertOrderWithOutbox(
+    msgId: string,
+    args: { userId: number; itemId: number; qty: number },
+  ): Promise<Order> {
+    const c = await this.pool.connect();
+    try {
+      await c.query('BEGIN');
+      const { rows } = await c.query(
+        'INSERT INTO orders(user_id, item_id, qty) VALUES($1, $2, $3) RETURNING id, user_id, item_id, qty, created_at',
+        [args.userId, args.itemId, args.qty],
+      );
+      const order: Order = rows[0];
+      await c.query(
+        'INSERT INTO outbox(msg_id, order_id, item_id, qty) VALUES($1, $2, $3, $4)',
+        [msgId, order.id, args.itemId, args.qty],
+      );
+      await c.query('COMMIT');
+      return order;
+    } catch (err) {
+      try { await c.query('ROLLBACK'); } catch { /* ignore cleanup error */ }
+      throw err;
+    } finally {
+      c.release();
+    }
+  }
+
+  // Lv22 outbox: 未配送の outbox 行を取得 (at-least-once 配送用)。
+  // Lv22 outbox: fetch undelivered outbox rows for at-least-once delivery.
+  async claimUndeliveredOutbox(
+    limit: number,
+  ): Promise<{ msg_id: string; order_id: number; item_id: number; qty: number }[]> {
+    const { rows } = await this.pool.query(
+      `SELECT msg_id, order_id, item_id, qty FROM outbox WHERE delivered_at IS NULL ORDER BY created_at LIMIT $1`,
+      [limit],
+    );
+    return rows;
+  }
+
+  // Lv22 outbox: 配送済みとしてマーク。
+  // Lv22 outbox: mark the outbox row as delivered.
+  async markOutboxDelivered(msgId: string): Promise<void> {
+    await this.pool.query(`UPDATE outbox SET delivered_at = now() WHERE msg_id = $1`, [msgId]);
+  }
 }

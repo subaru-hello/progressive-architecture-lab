@@ -23,6 +23,10 @@ export interface ItemsPort {
   // Lv19 saga: idempotent reserve / release (HTTP calls to /internal/reserve|release).
   reserveStock(gid: string, itemId: number, qty: number): Promise<{ ok: boolean; stock: number }>;
   releaseStock(gid: string): Promise<void>;
+
+  // Lv22 outbox: 冪等 decrement 配送 (outbox poller から呼ばれる)。
+  // Lv22 outbox: idempotent decrement delivery (called by the outbox poller).
+  deliverDecrement(msgId: string, itemId: number, qty: number): Promise<{ applied: boolean; duplicate: boolean }>;
 }
 
 // インプロセスアダプタ: 同一プロセス内の items リポジトリを直接呼ぶ。
@@ -66,6 +70,12 @@ export class InProcessItemsAdapter implements ItemsPort {
 
   releaseStock(gid: string): Promise<void> {
     return this.itemsRepo.release(gid);
+  }
+
+  // Lv22 outbox: インプロセスはリポジトリに直接委譲。
+  // Lv22 outbox: in-process delegates directly to the repo.
+  deliverDecrement(msgId: string, itemId: number, qty: number): Promise<{ applied: boolean; duplicate: boolean }> {
+    return this.itemsRepo.applyDecrementIdempotent(msgId, itemId, qty);
   }
 }
 
@@ -183,6 +193,14 @@ export class DualWriteItemsAdapter implements ItemsPort {
     return this.mode === 'secondary_only'
       ? this.secondary.releaseStock(gid)
       : this.primary.releaseStock(gid);
+  }
+
+  // Lv22 outbox: モードに応じてプライマリかセカンダリに委譲。
+  // Lv22 outbox: delegate to primary or secondary based on mode.
+  deliverDecrement(msgId: string, itemId: number, qty: number): Promise<{ applied: boolean; duplicate: boolean }> {
+    return this.mode === 'secondary_only'
+      ? this.secondary.deliverDecrement(msgId, itemId, qty)
+      : this.primary.deliverDecrement(msgId, itemId, qty);
   }
 
   async decrementStock(id: number, qty: number): Promise<{ ok: boolean; stock: number }> {
@@ -333,5 +351,19 @@ export class HttpItemsAdapter implements ItemsPort {
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) throw new Error(`items service releaseStock failed: ${res.status}`);
+  }
+
+  // Lv22 outbox: items-service の /internal/outbox/apply を呼ぶ (冪等 decrement 配送)。
+  // Lv22 outbox: call items-service /internal/outbox/apply (idempotent decrement delivery).
+  async deliverDecrement(msgId: string, itemId: number, qty: number): Promise<{ applied: boolean; duplicate: boolean }> {
+    const res = await fetch(`${this.baseUrl}/internal/outbox/apply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ msgId, itemId, qty }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error(`items service deliverDecrement failed: ${res.status}`);
+    const data = await res.json() as { applied: boolean; duplicate: boolean };
+    return { applied: data.applied, duplicate: data.duplicate };
   }
 }

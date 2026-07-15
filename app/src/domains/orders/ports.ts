@@ -46,4 +46,11 @@ export interface OrdersRepoPort {
   // 回復ポーラー用: state='reserved' かつ threshold より古い行を 'compensating' に更新して返す。
   // For recovery poller: atomically move stale 'reserved' rows to 'compensating' and return them.
   claimStuckSagaLogs(thresholdSeconds: number): Promise<SagaLogRow[]>;
+
+  // Lv22 outbox: orders insert + outbox insert を単一 tx で実行。
+  // Lv22 outbox: insert order and outbox row in a single tx on orders-db.
+  initOutboxSchema(): Promise<void>;
+  insertOrderWithOutbox(msgId: string, args: { userId: number; itemId: number; qty: number }): Promise<Order>;
+  claimUndeliveredOutbox(limit: number): Promise<{ msg_id: string; order_id: number; item_id: number; qty: number }[]>;
+  markOutboxDelivered(msgId: string): Promise<void>;
 }

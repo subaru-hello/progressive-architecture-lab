@@ -1,0 +1,72 @@
+# Lv22 — transactional outbox で exactly-once。none モード(dual-write 相当)の lost/ghost を、
+#   「order + outbox を同一 orders-db tx で書き、poller が items の冪等 receiver へ at-least-once 配送
+#    → dedup(processed_messages)で exactly-once」に置き換える。
+#
+#   api(coordinator, DB=db: orders+outbox) --HTTP(poller)--> items-service(SERVICE=items, DB=items-db: items+processed_messages)
+#
+# 使い方:
+#   起動:  docker compose -f stages/22-outbox/docker-compose.yml up --build -d
+#
+#   ① happy（同一tx で emit → poller が ~2s で配送 → stock 減・outbox delivered・processed_messages 1件）:
+#     curl -s -X POST localhost:3022/orders -H 'x-auth-token: demo-token-1' -H 'content-type: application/json' -d '{"itemId":3,"qty":5}'
+#     # 数秒後: SELECT delivered_at FROM outbox;  /  SELECT stock FROM items WHERE id=3;  /  SELECT count(*) FROM processed_messages;
+#
+#   ② exactly-once（配送後・mark前にクラッシュ → 再配送されるが dedup で二重にならない）:
+#     FAULT_POINT=after-deliver-before-mark docker compose ... up -d --no-deps api
+#     curl ... /orders {itemId:3, qty:5}                 # poller: 配送→throw→outbox 未 mark のまま
+#     # → items stock は 5 だけ減る(再配送されても processed_messages で dedup)。outbox は未配送のまま溜まる。
+#     FAULT_POINT= docker compose ... up -d --no-deps api  # 再起動 → 再配送 → dedup → mark → stock は二重に引かれない
+#
+# 確認:
+#   docker compose ... exec db       psql -U pal -d pal -c "SELECT msg_id,order_id,delivered_at FROM outbox;"
+#   docker compose ... exec items-db psql -U pal -d pal -c "SELECT count(*) FROM processed_messages;"
+#   docker compose ... exec items-db psql -U pal -d pal -c "SELECT stock FROM items WHERE id=3;"
+name: pal-lv22
+
+services:
+  db:                       # orders + outbox（coordinator 側 DB）
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: pal, POSTGRES_PASSWORD: pal, POSTGRES_DB: pal }
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U pal -d pal"], interval: 5s, timeout: 3s, retries: 10 }
+    volumes: [pgdata:/var/lib/postgresql/data]
+
+  items-db:                 # items + processed_messages（冪等 receiver 側）
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: pal, POSTGRES_PASSWORD: pal, POSTGRES_DB: pal }
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U pal -d pal"], interval: 5s, timeout: 3s, retries: 10 }
+    volumes: [items-pgdata:/var/lib/postgresql/data]
+
+  items-service:            # SERVICE=items（/internal/outbox/apply = 冪等 receiver を持つ）
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@items-db:5432/pal
+      ARCH: hex
+      SERVICE: items
+      SEED_DEMO: "1"
+      PORT: "3000"
+    depends_on:
+      items-db: { condition: service_healthy }
+
+  api:                      # coordinator。既定 ORDER_TX_MODE=outbox。outbox poller が配送。
+    build: ../../app
+    environment:
+      DATABASE_URL: postgres://pal:pal@db:5432/pal
+      ARCH: hex
+      SERVICE: all
+      ORDERS_CROSS_CONTEXT: port
+      ITEMS_SERVICE_URL: http://items-service:3000
+      ITEMS_MIGRATION_MODE: secondary_only
+      ORDER_TX_MODE: ${ORDER_TX_MODE:-outbox}    # Lv22 の主役
+      FAULT_POINT: ${FAULT_POINT:-}               # '' | after-deliver-before-mark(poller 内)
+      SEED_DEMO: "1"
+      PG_POOL_MAX: "10"
+      PORT: "3000"
+    ports:
+      - "3022:3000"
+    depends_on:
+      db: { condition: service_healthy }
+      items-service: { condition: service_started }
+
+volumes:
+  pgdata:
+  items-pgdata:

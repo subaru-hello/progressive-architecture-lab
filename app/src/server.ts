@@ -208,6 +208,10 @@ const cacheCounters = { hits: 0, misses: 0 };
 // Lv19 saga recovery poller: started only in saga mode when orders are loaded.
 let sagaPoller: ReturnType<typeof setInterval> | null = null;
 
+// Lv22 outbox ポーラー: outbox モードかつ orders ロード時のみ起動。
+// Lv22 outbox poller: started only in outbox mode when orders are loaded.
+let outboxPoller: ReturnType<typeof setInterval> | null = null;
+
 const app = Fastify({ logger: true });
 
 // onResponse フックは全ルートに適用されるよう、プラグイン登録より前に addHook する。
@@ -444,6 +448,34 @@ if (ARCH === 'mud') {
       }, 2000);
     }
 
+    // Lv22 outbox ポーラー: outbox モード + orders ロード時に起動。
+    // Lv22 outbox poller: start when outbox mode is active and orders are loaded.
+    if (ORDER_TX_MODE === 'outbox') {
+      const pollerOrdersRepo = ordersRepo;
+      const pollerItemsPort = itemsPort;
+
+      outboxPoller = setInterval(async () => {
+        try {
+          const rows = await pollerOrdersRepo.claimUndeliveredOutbox(50);
+          for (const r of rows) {
+            try {
+              await pollerItemsPort.deliverDecrement(r.msg_id, r.item_id, r.qty);
+              // FAULT POINT: after-deliver-before-mark — 配送後・mark前に throw (クラッシュ相当)。
+              // 再配送されるが receiver が dedup するので二重にならない。
+              // FAULT POINT: after-deliver-before-mark — throw after delivery, before mark (crash sim).
+              // Re-delivery is safe: receiver deduplicates via processed_messages.
+              if (FAULT_POINT === 'after-deliver-before-mark') throw new Error('[fault] after-deliver-before-mark');
+              await pollerOrdersRepo.markOutboxDelivered(r.msg_id);
+            } catch (e) {
+              app.log.warn({ msg_id: r.msg_id, err: e }, 'outbox poller: delivery failed, will retry');
+            }
+          }
+        } catch (e) {
+          app.log.warn({ err: e }, 'outbox poller: claim failed');
+        }
+      }, 2000);
+    }
+
     // Lv21 2PC 起動時リゾルバ: 2pc モード + orders ロード時のみ。ここでは thunk を格納するだけで、
     // 実行は main() が initDb()(tx_journal 作成)完了後・listen 前に await する(schema レース回避 +
     // 将来 coordinator を多重化しても live traffic の in-flight 2pc とレースしない)。
@@ -555,6 +587,9 @@ async function initDb(): Promise<void> {
     // Lv21 2PC 決定ジャーナル: saga_log と同様に常に作成 (MODE 非依存)。
     // Lv21 2PC decision journal: always create alongside saga_log (mode-independent).
     await repo.initTxJournalSchema();
+    // Lv22 outbox: outbox テーブルを常に作成 (MODE 非依存)。
+    // Lv22 outbox: always create outbox table (mode-independent).
+    await repo.initOutboxSchema();
   }
   if (loadItems) {
     // Lv19 saga: reservations は items ドメインが所有するテーブル。
@@ -565,6 +600,9 @@ async function initDb(): Promise<void> {
     // so it is a ready protocol participant when the coordinator calls /internal/reserve.
     const repo = new PgItemsRepo(writePool, readPool);
     await repo.initSagaSchema();
+    // Lv22 outbox: processed_messages は items ドメインが所有するテーブル (冪等 receiver 用)。
+    // Lv22 outbox: processed_messages is owned by the items domain (idempotent receiver inbox).
+    await repo.initInboxSchema();
   }
 }
 
@@ -643,6 +681,9 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     // Lv19 saga ポーラーを停止。
     // Lv19: stop the saga recovery poller before closing connections.
     if (sagaPoller !== null) clearInterval(sagaPoller);
+    // Lv22 outbox ポーラーを停止。
+    // Lv22: stop the outbox poller before closing connections.
+    if (outboxPoller !== null) clearInterval(outboxPoller);
     try {
       await app.close();
       await Promise.all([writePool.end(), readPool.end(), ...(redis ? [redis.quit()] : []), ...(pool ? [pool.destroy()] : [])]);

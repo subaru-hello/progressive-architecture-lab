@@ -246,6 +246,18 @@ export async function itemsRoutes(app: FastifyInstance, opts: ItemsPluginOptions
     return { ok: true };
   });
 
+  // Lv22 outbox: 冪等 decrement receiver。outbox poller から呼ばれる。
+  // Lv22 outbox: idempotent decrement receiver; called by the outbox poller.
+  app.post('/internal/outbox/apply', async (req, reply) => {
+    const body = req.body as { msgId?: string; itemId?: number; qty?: number };
+    if (!body?.msgId || body.itemId == null || body.qty == null || body.qty <= 0) {
+      reply.code(400);
+      return { error: 'msgId, itemId, and positive qty are required' };
+    }
+    const result = await itemsRepo.applyDecrementIdempotent(body.msgId, Number(body.itemId), Number(body.qty));
+    return result;
+  });
+
   // Lv18 バックフィル用: 全 item 取得（LIMIT なし）。ストラングラーフィグ移行時のソース DB 読み取り。
   // Lv18 backfill: fetch ALL items (no LIMIT) — read source-of-truth during strangler-fig migration.
   app.get('/internal/items/all', async () => {
