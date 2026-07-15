@@ -1,0 +1,83 @@
+# coordinator(api): orders+users を束ねる。ORDER_TX_MODE を kubectl set env で差替えて3方式を測定。
+# podAntiAffinity(preferred) で items-service と別ノードに配置 → pod 間トラフィックがノード境界を越える。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: pal-lv20
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: items-service
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: api
+          image: pal-api:lv20
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: DATABASE_URL, value: "postgres://pal:pal@db:5432/pal" }
+            - { name: ARCH, value: hex }
+            - { name: SERVICE, value: all }
+            - { name: ORDERS_CROSS_CONTEXT, value: port }
+            - { name: ITEMS_SERVICE_URL, value: "http://items-service:3000" }
+            - { name: ITEMS_MIGRATION_MODE, value: secondary_only }
+            - { name: ORDER_TX_MODE, value: none }   # none | 2pc | saga（kubectl set env で差替）
+            - { name: FAULT_POINT, value: "" }        # "" | after-first-write | after-prepare-all
+            - { name: SEED_DEMO, value: "1" }
+            - { name: PG_POOL_MAX, value: "10" }
+            - { name: PORT, value: "3000" }
+          ports:
+            - containerPort: 3000
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            periodSeconds: 3
+            failureThreshold: 30   # 最大 90s まで起動を待つ
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: pal-lv20
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 3000

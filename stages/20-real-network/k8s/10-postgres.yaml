@@ -1,0 +1,114 @@
+# 2 つの Postgres。2PC 用に max_prepared_transactions=50 を引数で渡す。
+# storage は計測用の emptyDir（揮発で良い。PVC 不要）。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+  namespace: pal-lv20
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          args: ["-c", "max_prepared_transactions=50"]
+          env:
+            - { name: POSTGRES_USER, value: pal }
+            - { name: POSTGRES_PASSWORD, value: pal }
+            - { name: POSTGRES_DB, value: pal }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "pal", "-d", "pal"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: pal-lv20
+spec:
+  selector:
+    app: db
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: items-db
+  namespace: pal-lv20
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: items-db
+  template:
+    metadata:
+      labels:
+        app: items-db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          args: ["-c", "max_prepared_transactions=50"]
+          env:
+            - { name: POSTGRES_USER, value: pal }
+            - { name: POSTGRES_PASSWORD, value: pal }
+            - { name: POSTGRES_DB, value: pal }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "pal", "-d", "pal"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: items-db
+  namespace: pal-lv20
+spec:
+  selector:
+    app: items-db
+  ports:
+    - port: 5432
+      targetPort: 5432

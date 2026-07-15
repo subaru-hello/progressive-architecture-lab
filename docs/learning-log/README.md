@@ -33,3 +33,4 @@
 - [Lv17 — 解きほぐし（mud → hexagonal）：結合を seam 1 本に落とす（層化は runtime 無料・境界＝事前の切断線）](17-lv17.md)
 - [Lv18 — ダウンタイムゼロ抽出（strangler-fig）：hex を live で移す（規律=0% / naive=66.7% / 泥団子=100% ダウン）](18-lv18.md)
 - [Lv19 — 分散トランザクション（none/2PC/saga）：タダの分散tx は無い（2PC=原子性↔ブロッキング / saga=可用性↔中間状態）](19-lv19.md)
+- [Lv20 — 実ネットワークの税（k3d 化）：往復差は「平均」でなく「裾」に出る（dataplane floor は全モード一律・2PC はテールで壊れる）](20-lv20.md)

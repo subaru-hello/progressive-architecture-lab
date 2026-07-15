@@ -1,0 +1,68 @@
+# items-service: 在庫の権威サービス。items-db に接続。SEED_DEMO=1 で在庫データを seed。
+# DB 起動待ちがあるので startupProbe を寛容に（failureThreshold=40 = 最大 120s 待機）。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: items-service
+  namespace: pal-lv20
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: items-service
+  template:
+    metadata:
+      labels:
+        app: items-service
+    spec:
+      containers:
+        - name: api
+          image: pal-api:lv20
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: DATABASE_URL, value: "postgres://pal:pal@items-db:5432/pal" }
+            - { name: ARCH, value: hex }
+            - { name: SERVICE, value: items }
+            - { name: SEED_DEMO, value: "1" }
+            - { name: PORT, value: "3000" }
+          ports:
+            - containerPort: 3000
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            periodSeconds: 3
+            failureThreshold: 40   # 最大 120s まで起動を待つ（DB seed 込み）
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: items-service
+  namespace: pal-lv20
+spec:
+  selector:
+    app: items-service
+  ports:
+    - port: 3000
+      targetPort: 3000

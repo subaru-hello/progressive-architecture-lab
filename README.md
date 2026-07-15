@@ -33,6 +33,10 @@ Lv0 docker-compose      Lv1 compose + proxy       Lv2 k3s 単一ノード       
   Lv16 泥団子(mud)      →   Lv17 解きほぐし(hex)   →   Lv18 live抽出(strangler)  →   Lv19 分散tx(none/2PC/saga)
   引っ越しやすさ＝結合度      結合を seam 1本に(JOIN/FK→0)  規律=0%/naive=66.7%/泥団子=100%   タダの分散txは無い
   naive移行は100%ダウン       層化は runtime 無料(4.85ms)  seam×手順の積・shadowで検証後cutover 2PC=原子性↔ブロッキング/saga=可用性↔中間状態
+
+  ── さらに別軸：分散tx を本番グレードへ（実ネット税 → 2PC自動回復 → outbox → choreography）──
+  Lv20 実ネット税(k3d化)
+  往復差は「平均」でなく「裾」に出る：dataplane floor は全モード一律(~5x)・2PC はテールで壊れる(p95 1.38s)・in-doubt は基盤跨いでも再現
 ```
 
 各段は **同じ `app/`（Node/TS + Postgres API）** を使い回す。基盤だけが変わる。

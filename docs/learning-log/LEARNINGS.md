@@ -294,6 +294,25 @@ Lv18 で items が別DBになった後、POST /orders の在庫(items-db)+order(
 
 ---
 
+## 39. ⭐ 分散tx の実ネットワーク税は「平均」でなく「裾」に出る — dataplane floor は全モード一律、2PC の余分な往復はテールを壊す `[Lv20]`
+Lv19 の 2DB 跨ぎ order(none/2PC/saga)を **app 無改造のまま docker-compose → k3d 実クラスタ**に載せ替え、coordinator と
+items-service を **別ノードに配置**して在庫調停 HTTP を k8s dataplane(flannel+kube-proxy+ClusterIP DNS)越しにした:
+- **dataplane floor は全モード一律・往復本数に非依存**: median が compose 3-5ms → k3d 18-27ms(**~5x**)。
+  docker bridge の直結が隠していた「1 往復の値段」を k8s ネットワークが可視化する。**この床が median を支配するので、
+  往復本数差(2PC=2 / none・saga=1)は median の中では相対的に縮む**(2PC/none 比 compose 1.6x → k3d 1.16x)。
+  「実ネットワークにすると 2PC が平均で急に遅くなる」は起きない——floor が皆に一律に乗るから。
+- **2PC の税は median でなくテールと競合耐性に出る**: 2PC は prepared txn を「余分な cross-node 往復」越しに保持する分
+  critical section が長く、host が混むと p95 が 57ms→**1.38s**、max **3.73s** まで跳ねる。none/saga は 1 往復で裾が有界(p95~90ms)。
+  → **SLO を p50 で切ると 2PC の危険が見えない。分散tx の実ネットワーク税は平均でなく裾を読め**。
+- **プロトコルの弱点は基盤を引っ越しても付いてくる**: in-doubt(FAULT_POINT=after-prepare-all)は k3d でも「両DBに prepared・
+  行ロック・手動 `ROLLBACK PREPARED`」のまま同一再現。基盤を変えても 2PC の宙吊りは消えない → Lv21 で coordinator に
+  決定ジャーナル+起動時 resolver を入れて自動回復させる動機。
+- **正直な枠付け**: 同一 Mac 上なので物理は loopback = これは **k8s dataplane 税**で WAN 遅延ではない(地理 RTT は `tc netem` で)。
+  また host load が 11→22 で乱高下し median ですら ±40% 揺れた——頑健な信号は「floor の存在」「2PC テール爆発」「in-doubt 再現」の
+  **質的差**で、モード間 median 差(~1.5x 以内)は noise 隣接。教訓6/「相対で読め」の実ネットワーク版。
+
+---
+
 ## メタな学び
 - **同じアプリを全段で使い回し、基盤だけ変える**と、数字がフェアに比較でき「何が効いたか」を切り分けられる。
 - **observability（`instance` 可視化・`/metrics`・k6）を最初の段から**入れると、後段の異常にすぐ気づける。
